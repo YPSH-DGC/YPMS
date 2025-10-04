@@ -6,5 +6,5 @@
     "ypms.repo.structure.version": "1.0",
     "ypms.repo.url": "https://ypsh-dgc.github.io/YPMS/yopr",
     "ypms.repo.path.index": "/index.json",
-    "ypms.repo.path.package": "/packages/{USER_ID}/{PACKAGE_ID}/info.json"
+    "ypms.repo.path.package": "/{USER_ID}/{PACKAGE_ID}/info.json"
 }

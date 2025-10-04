@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 # -- PyYPSH ----------------------------------------------------- #
 # ypms.py on PyYPSH                                               #
@@ -10,13 +9,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import platform
+import shutil
 import sys
+import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List, Union
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -31,13 +34,15 @@ load_dotenv()
 YPMS_DIR: str = os.environ.get("YPMS_DIR") or os.path.join(os.path.expanduser("~"), ".ypms")
 YPMS_ENVS_DIR: str = os.environ.get("YPMS_ENVS_DIR") or os.path.join(YPMS_DIR, "envs")
 SOURCES_PATH: str = os.path.join(YPMS_DIR, "sources.json")
+INSTALLED_DB_PATH: str = os.path.join(YPMS_DIR, "installed.json")
+CACHE_DIR: str = os.path.join(YPMS_DIR, "cache")
 
 DEFAULT_SOURCES: Dict[str, str] = {
     "yopr": "https://ypsh-dgc.github.io/YPMS/yopr/ypms.json"
 }
 
 USER_AGENT = "YPMS/1.1 (+https://github.com/YPSH-DGC/YPMS/)"
-HTTP_TIMEOUT = 20  # seconds
+HTTP_TIMEOUT = 20
 
 
 # ---- Exceptions ------------------------------------------------ #
@@ -46,9 +51,63 @@ class YPMSError(Exception):
     pass
 
 
-# ---- HTTP helpers --------------------------------------------- #
+# ---- Platform helpers ----------------------------------------- #
 
-def _http_get_json(url: str) -> Dict[str, Any]:
+def _norm_os() -> str:
+    sp = sys.platform
+    if sp.startswith("win"):
+        return "windows"
+    if sp.startswith("darwin"):
+        return "darwin"
+    return "linux"
+
+def _norm_arch() -> str:
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64", "x64"):
+        return "x86_64"
+    if m in ("arm64", "aarch64"):
+        return "arm64"
+    return m or "unknown"
+
+def _when_matches(when: Optional[Dict[str, List[str]]]) -> bool:
+    if not when:
+        return True
+    os_ok = True
+    arch_ok = True
+    if "os" in when:
+        os_ok = _norm_os() in {s.lower() for s in when["os"]}
+    if "arch" in when:
+        norm_arches = set()
+        for a in when["arch"]:
+            a = a.lower()
+            if a in ("x86_64", "amd64", "x64"):
+                norm_arches.add("x86_64")
+            elif a in ("arm64", "aarch64"):
+                norm_arches.add("arm64")
+            else:
+                norm_arches.add(a)
+        arch_ok = _norm_arch() in norm_arches
+    return os_ok and arch_ok
+
+
+# ---- Simple JSON cache ---------------------------------------- #
+
+def _ensure_cache_dir() -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+def _cache_key(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest() + ".json"
+
+def _http_get_json(url: str, *, use_cache: bool = True, force_refresh: bool = False) -> Dict[str, Any]:
+    _ensure_cache_dir()
+    cpath = os.path.join(CACHE_DIR, _cache_key(url))
+    if use_cache and not force_refresh and os.path.exists(cpath):
+        try:
+            with open(cpath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
@@ -56,10 +115,16 @@ def _http_get_json(url: str) -> Dict[str, Any]:
                 raise YPMSError(f"HTTP {resp.status} for {url}")
             data = resp.read()
             try:
-                return json.loads(data.decode("utf-8"))
+                obj = json.loads(data.decode("utf-8"))
+                try:
+                    with open(cpath, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                return obj
             except json.JSONDecodeError as e:
                 raise YPMSError(f"Invalid JSON at {url}: {e}") from e
-    except urllib.error.URLError as e:  # includes HTTPError
+    except urllib.error.URLError as e:
         raise YPMSError(f"Failed to GET {url}: {e}") from e
 
 
@@ -79,6 +144,11 @@ def _http_download(url: str, dest_path: str) -> None:
         raise YPMSError(f"Failed to download {url}: {e}") from e
 
 
+def _clear_all_cache() -> None:
+    if os.path.isdir(CACHE_DIR):
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+
+
 # ---- Source / Package ----------------------------------------- #
 
 @dataclass
@@ -94,10 +164,10 @@ class RepoConfig:
 class YPMSSource:
     """A single package source (repository)."""
 
-    def __init__(self, source_name: str, config_url: str):
+    def __init__(self, source_name: str, config_url: str, *, force_refresh: bool = False):
         self.source_name = source_name
         self.config_url = config_url
-        cfg = _http_get_json(config_url)
+        cfg = _http_get_json(config_url, use_cache=True, force_refresh=force_refresh)
         try:
             self.config = RepoConfig(
                 repo_id=cfg["ypms.repo.id"],
@@ -120,11 +190,11 @@ class YPMSSource:
         )
 
     # Fetchers
-    def fetch_index(self) -> Dict[str, Any]:
-        return _http_get_json(self._index_url())
+    def fetch_index(self, *, force_refresh: bool = False) -> Dict[str, Any]:
+        return _http_get_json(self._index_url(), use_cache=True, force_refresh=force_refresh)
 
-    def fetch_package_info(self, user_id: str, package_id: str) -> Dict[str, Any]:
-        return _http_get_json(self._package_url(user_id, package_id))
+    def fetch_package_info(self, user_id: str, package_id: str, *, force_refresh: bool = False) -> Dict[str, Any]:
+        return _http_get_json(self._package_url(user_id, package_id), use_cache=True, force_refresh=force_refresh)
 
     @staticmethod
     def resolve_release_tag(pkg_info: Dict[str, Any], tag: Optional[str]) -> str:
@@ -140,10 +210,10 @@ class YPMSSource:
         alias = pkg_info.get("package.release.alias", {})
         return alias.get(tag, tag)
 
-    def fetch_release_info(self, pkg_info: Dict[str, Any], release_id: str) -> Dict[str, Any]:
+    def fetch_release_info(self, pkg_info: Dict[str, Any], release_id: str, *, force_refresh: bool = False) -> Dict[str, Any]:
         url_tmpl = pkg_info["package.release.url"]
         url = url_tmpl.format(RELEASE_ID=release_id)
-        return _http_get_json(url)
+        return _http_get_json(url, use_cache=True, force_refresh=force_refresh)
 
 
 class YPMSPackage:
@@ -165,29 +235,102 @@ class YPMSPackage:
     def _resolve_env_dest(self, template: str, env_dir: str) -> str:
         return template.replace("{YPMS_ENV_DIR}", env_dir)
 
-    def run_guide(self, env_dir: str, version_tag: Optional[str], guide_name: str) -> str:
-        """Run an arbitrary guide existing in release.guides[guide_name]."""
-        resolved = self.source.resolve_release_tag(self.pkg_info, version_tag)
-        rel = self.source.fetch_release_info(self.pkg_info, resolved)
 
-        guides = rel.get("release.guides", {})
-        guide = guides.get(guide_name)
-        if not guide:
-            raise YPMSError(f"Guide '{guide_name}' not defined for release '{resolved}'.")
+# ---- Guide execution helpers ---------------------------------- #
 
-        gtype = guide.get("type")
+def _normalize_guide_to_steps(guide_obj: Any) -> List[Dict[str, Any]]:
+    """
+    Accepts either:
+      - {"type": "...", "content": {...}, "when": {...}}
+      - {"steps": [ {...}, {...} ]}
+    Returns a list of step dicts.
+    """
+    if not isinstance(guide_obj, dict):
+        raise YPMSError("Guide object must be a dict")
+    if "steps" in guide_obj:
+        steps = guide_obj["steps"]
+        if not isinstance(steps, list):
+            raise YPMSError("Guide.steps must be a list")
+        return steps
+    return [guide_obj]
+
+def _exec_step_download_only(step: Dict[str, Any], *, env_dir: str) -> str:
+    content = step["content"]
+    dest_template: str = content["dest"]
+    url: str = content["url"]
+    dest_path = dest_template.replace("{YPMS_ENV_DIR}", env_dir)
+    _http_download(url, dest_path)
+    return dest_path
+
+def _exec_step_python(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any]) -> str:
+    """
+    Execute Python code provided in step["content"].
+    content can be:
+      - {"code": "...", "cwd": "..."}  OR
+      - a plain string (treated as code)
+    The executed code can optionally set a variable named `RESULT_PATH`
+    to pass back a path-like string for display.
+    """
+    content = step.get("content")
+    if isinstance(content, str):
+        code = content
+        cwd = None
+    elif isinstance(content, dict):
+        code = content.get("code", "")
+        cwd = content.get("cwd")
+    else:
+        raise YPMSError("python guide: invalid content")
+
+    if not isinstance(code, str) or not code.strip():
+        raise YPMSError("python guide: empty code")
+
+    g: Dict[str, Any] = {
+        "__name__": "__main__",
+        "YPMS_ENV_DIR": env_dir,
+        "OS": _norm_os(),
+        "ARCH": _norm_arch(),
+        **context,  # package/source context
+    }
+    l: Dict[str, Any] = {}
+    old_cwd = None
+    try:
+        if cwd:
+            old_cwd = os.getcwd()
+            os.makedirs(cwd, exist_ok=True)
+            os.chdir(cwd)
+        exec(compile(code, "<ypms_guide_python>", "exec"), g, l)
+    finally:
+        if old_cwd is not None:
+            os.chdir(old_cwd)
+
+    result_path = l.get("RESULT_PATH") or g.get("RESULT_PATH")
+    return str(result_path) if result_path else ""
+
+def _execute_guide_steps(*, guide_obj: Dict[str, Any], env_dir: str,
+                         pkg_ctx: Dict[str, Any]) -> str:
+    """
+    Execute a guide object (single or multi-step with conditions).
+    Returns last non-empty result (e.g., a downloaded path).
+    """
+    steps = _normalize_guide_to_steps(guide_obj)
+    ran_any = False
+    last_result = ""
+    for step in steps:
+        if not isinstance(step, dict):
+            raise YPMSError("Guide step must be a dict")
+        if not _when_matches(step.get("when")):
+            continue
+        gtype = step.get("type")
         if gtype == "download-only":
-            content = guide["content"]
-            dest_template: str = content["dest"]
-            url: str = content["url"]
-            dest_path = self._resolve_env_dest(dest_template, env_dir)
-            _http_download(url, dest_path)
-            return dest_path
-
-        raise YPMSError(f"Unsupported guide type: {gtype}")
-
-    def install(self, env_dir: str, version_tag: Optional[str] = None) -> str:
-        return self.run_guide(env_dir=env_dir, version_tag=version_tag, guide_name="install")
+            last_result = _exec_step_download_only(step, env_dir=env_dir)
+        elif gtype == "python":
+            last_result = _exec_step_python(step, env_dir=env_dir, context=pkg_ctx)
+        else:
+            raise YPMSError(f"Unsupported guide type: {gtype}")
+        ran_any = True
+    if not ran_any:
+        raise YPMSError("No guide step matched current platform/arch")
+    return last_result
 
 
 # ---- Manager --------------------------------------------------- #
@@ -200,8 +343,8 @@ class YPMSManager:
         self.envs_dir = envs_dir
         os.makedirs(self.ypms_dir, exist_ok=True)
         os.makedirs(self.envs_dir, exist_ok=True)
+        os.makedirs(CACHE_DIR, exist_ok=True)
 
-        # Initialize default sources.json if missing
         if not os.path.exists(SOURCES_PATH):
             with open(SOURCES_PATH, "w", encoding="utf-8") as f:
                 json.dump(DEFAULT_SOURCES, f, ensure_ascii=False, indent=2)
@@ -209,6 +352,57 @@ class YPMSManager:
         self.sources_map = self._load_sources()
         self._source_cache: Dict[str, YPMSSource] = {}
 
+        if not os.path.exists(INSTALLED_DB_PATH):
+            with open(INSTALLED_DB_PATH, "w", encoding="utf-8") as f:
+                json.dump({"envs": {}}, f, ensure_ascii=False, indent=2)
+
+    # ---- DB helpers (installed.json) ----
+    def _db_load(self) -> Dict[str, Any]:
+        try:
+            with open(INSTALLED_DB_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {"envs": {}}
+
+    def _db_save(self, obj: Dict[str, Any]) -> None:
+        with open(INSTALLED_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+
+    def _db_key(self, source: str, package_ref: str) -> str:
+        return f"{source}:{package_ref}"
+
+    def _db_mark_installed(self, *, env: str, source: str, package_ref: str,
+                           version: str, explicit: bool) -> None:
+        db = self._db_load()
+        envs = db.setdefault("envs", {})
+        e = envs.setdefault(env, {})
+        key = self._db_key(source, package_ref)
+        e[key] = {
+            "source": source,
+            "package": package_ref,
+            "version": version,
+            "explicit": bool(explicit),
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        self._db_save(db)
+
+    def _db_mark_uninstalled(self, *, env: str, source: str, package_ref: str) -> None:
+        db = self._db_load()
+        envs = db.get("envs", {})
+        e = envs.get(env, {})
+        key = self._db_key(source, package_ref)
+        if key in e:
+            e.pop(key)
+            self._db_save(db)
+
+    def list_installed(self, env: Optional[str] = None) -> Dict[str, Any]:
+        db = self._db_load()
+        all_envs = db.get("envs", {})
+        if env:
+            return {env: all_envs.get(env, {})}
+        return all_envs
+
+    # ---- Sources ops ----
     def _load_sources(self) -> Dict[str, str]:
         try:
             with open(SOURCES_PATH, "r", encoding="utf-8") as f:
@@ -225,7 +419,6 @@ class YPMSManager:
         with open(SOURCES_PATH, "w", encoding="utf-8") as f:
             json.dump(self.sources_map, f, ensure_ascii=False, indent=2)
 
-    # Sources ops
     def list_sources(self) -> Dict[str, str]:
         return dict(self.sources_map)
 
@@ -240,8 +433,8 @@ class YPMSManager:
             self.save_sources()
         self._source_cache.pop(name, None)
 
-    # Source access
-    def _get_source(self, source_name: Optional[str]) -> YPMSSource:
+    # ---- Source access ----
+    def _get_source(self, source_name: Optional[str], *, force_refresh: bool = False) -> YPMSSource:
         if not source_name:
             if "yopr" in self.sources_map:
                 source_name = "yopr"
@@ -250,18 +443,18 @@ class YPMSManager:
                     raise YPMSError("No sources configured.")
                 source_name = sorted(self.sources_map.keys())[0]
 
-        if source_name in self._source_cache:
+        if not force_refresh and source_name in self._source_cache:
             return self._source_cache[source_name]
 
         url = self.sources_map.get(source_name)
         if not url:
             raise YPMSError(f"Unknown source: {source_name}")
 
-        src = YPMSSource(source_name, url)
+        src = YPMSSource(source_name, url, force_refresh=force_refresh)
         self._source_cache[source_name] = src
         return src
 
-    # Env utils
+    # ---- Env utils ----
     def ensure_env_dir(self, env_id: str) -> str:
         env_dir = os.path.join(self.envs_dir, env_id)
         os.makedirs(env_dir, exist_ok=True)
@@ -277,7 +470,7 @@ class YPMSManager:
                 envs[name] = path
         return envs
 
-    # Packages
+    # ---- Packages & Guides ----
     def list_packages(self, source_name: Optional[str] = None) -> Dict[str, Any]:
         src = self._get_source(source_name)
         return src.fetch_index()
@@ -290,18 +483,11 @@ class YPMSManager:
         info["_package_ref"] = f"{user}/{pkg}"
         return info
 
-    def install(self, package_ref: str, env: str = "default", version: Optional[str] = None,
-                source_name: Optional[str] = None) -> str:
-        return self.run(package_ref, guide_name="install", env=env, version=version, source_name=source_name)
-
-    def run(self, package_ref: str, guide_name: str, env: str = "default", version: Optional[str] = None,
-            source_name: Optional[str] = None) -> str:
-        """Run an arbitrary guide by name (e.g., 'update', 'uninstall', etc.)."""
-        user, pkg = self._split_pkg_ref(package_ref)
-        src = self._get_source(source_name)
-        env_dir = self.ensure_env_dir(env)
-        yp = YPMSPackage(src, user, pkg)
-        return yp.run_guide(env_dir=env_dir, version_tag=version, guide_name=guide_name)
+    def _get_release_info(self, src: YPMSSource, pkg_info: Dict[str, Any],
+                          version_tag: Optional[str], *, force_refresh: bool = False) -> Tuple[str, Dict[str, Any]]:
+        resolved = src.resolve_release_tag(pkg_info, version_tag)
+        rel = src.fetch_release_info(pkg_info, resolved, force_refresh=force_refresh)
+        return resolved, rel
 
     @staticmethod
     def _split_pkg_ref(ref: str) -> Tuple[str, str]:
@@ -314,10 +500,141 @@ class YPMSManager:
             raise YPMSError("Invalid package ref")
         return user, pkg
 
+    # ---- Dependency parsing ----
+    @staticmethod
+    def _parse_dep(dep: Union[str, Dict[str, Any]]) -> Tuple[str, Optional[str]]:
+        """
+        Returns (package_ref, version_tag|None)
+        Accepts: "user/pkg", "user/pkg@tag", { "package": "user/pkg", "version": "tag" }
+        """
+        if isinstance(dep, str):
+            if "@" in dep:
+                pref, ver = dep.split("@", 1)
+                return pref.strip(), ver.strip() or None
+            return dep.strip(), None
+        if isinstance(dep, dict):
+            pref = dep.get("package")
+            ver = dep.get("version")
+            if not pref or not isinstance(pref, str):
+                raise YPMSError("Invalid dependency object: missing 'package'")
+            return pref.strip(), (str(ver).strip() if ver else None)
+        raise YPMSError("Invalid dependency entry (must be string or object)")
+
+    # ---- High level actions ----
+    def install(self, package_ref: str, env: str = "default", version: Optional[str] = None,
+                source_name: Optional[str] = None, *, explicit: bool = True) -> str:
+        user, pkg = self._split_pkg_ref(package_ref)
+        src = self._get_source(source_name)
+        env_dir = self.ensure_env_dir(env)
+        yp = YPMSPackage(src, user, pkg)
+
+        resolved, rel = self._get_release_info(src, yp.pkg_info, version)
+        pkg_ctx = {
+            "PACKAGE_REF": f"{user}/{pkg}",
+            "SOURCE_NAME": src.source_name,
+            "RELEASE_ID": resolved,
+        }
+        guides = rel.get("release.guides", {})
+        guide = guides.get("install")
+        if not guide:
+            raise YPMSError("Guide 'install' not defined for this package")
+        dest = _execute_guide_steps(guide_obj=guide, env_dir=env_dir, pkg_ctx=pkg_ctx)
+
+        self._db_mark_installed(env=env, source=src.source_name,
+                                package_ref=f"{user}/{pkg}", version=resolved, explicit=explicit)
+
+        for dep in rel.get("release.depends", []):
+            dep_ref, dep_ver = self._parse_dep(dep)
+            self.install(dep_ref, env=env, version=dep_ver, source_name=source_name, explicit=False)
+
+        return dest
+
+    def run(self, package_ref: str, guide_name: str, env: str = "default", version: Optional[str] = None,
+            source_name: Optional[str] = None) -> str:
+        """Run an arbitrary guide by name (e.g., 'update', 'uninstall', etc.)."""
+        user, pkg = self._split_pkg_ref(package_ref)
+        src = self._get_source(source_name)
+        env_dir = self.ensure_env_dir(env)
+        yp = YPMSPackage(src, user, pkg)
+
+        resolved, rel = self._get_release_info(src, yp.pkg_info, version)
+        pkg_ctx = {
+            "PACKAGE_REF": f"{user}/{pkg}",
+            "SOURCE_NAME": src.source_name,
+            "RELEASE_ID": resolved,
+        }
+        guides = rel.get("release.guides", {})
+        guide = guides.get(guide_name)
+        if not guide:
+            raise YPMSError(f"Guide '{guide_name}' not defined for release '{resolved}'.")
+
+        dest = _execute_guide_steps(guide_obj=guide, env_dir=env_dir, pkg_ctx=pkg_ctx)
+
+        if guide_name == "uninstall":
+            self._db_mark_uninstalled(env=env, source=src.source_name, package_ref=f"{user}/{pkg}")
+
+        return dest
+
+    # ---- Refresh/Upgrade/Autoremove ----
+    def refresh_sources(self) -> None:
+        """Clear all caches and re-fetch/warm each source config and index."""
+        _clear_all_cache()
+        self._source_cache.clear()
+        for name, url in self.sources_map.items():
+            src = self._get_source(name, force_refresh=True)
+            _ = src.fetch_index(force_refresh=True)
+
+    def upgrade(self, env: Optional[str] = None) -> List[str]:
+        """
+        Refresh caches, then run 'update' guide on all installed packages
+        (in selected env or all envs) if available.
+        Returns list of "pkg -> result".
+        """
+        self.refresh_sources()
+        results: List[str] = []
+        installed_by_env = self.list_installed(env=env)
+        for env_name, pkgs in installed_by_env.items():
+            for key, meta in pkgs.items():
+                src_name = meta["source"]
+                package_ref = meta["package"]
+                version = meta.get("version")
+                try:
+                    res = self.run(package_ref=package_ref, guide_name="update",
+                                   env=env_name, version=version, source_name=src_name)
+                    results.append(f"{env_name}:{package_ref} -> {res}")
+                except YPMSError as e:
+                    if "not defined" in str(e):
+                        continue
+                    results.append(f"{env_name}:{package_ref} [ERROR] {e}")
+        return results
+
+    def autoremove(self, env: Optional[str] = None) -> List[str]:
+        """
+        For packages that are NOT explicit (implicit deps), attempt to run 'uninstall'.
+        Returns list of "pkg -> result" or errors.
+        """
+        results: List[str] = []
+        installed_by_env = self.list_installed(env=env)
+        for env_name, pkgs in installed_by_env.items():
+            targets = [meta for meta in pkgs.values() if not meta.get("explicit")]
+            for meta in targets:
+                src_name = meta["source"]
+                package_ref = meta["package"]
+                version = meta.get("version")
+                try:
+                    res = self.run(package_ref=package_ref, guide_name="uninstall",
+                                   env=env_name, version=version, source_name=src_name)
+                    results.append(f"{env_name}:{package_ref} -> {res}")
+                except YPMSError as e:
+                    if "not defined" in str(e):
+                        continue
+                    results.append(f"{env_name}:{package_ref} [ERROR] {e}")
+        return results
+
 
 # ---- CLI (flexible command parsing) ---------------------------- #
 
-BUILTIN_CMDS = {"list", "info", "install", "envs", "sources"}
+BUILTIN_CMDS = {"list", "info", "install", "envs", "sources", "refresh", "upgrade", "autoremove"}
 
 def _build_full_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -358,6 +675,17 @@ def _build_full_parser() -> argparse.ArgumentParser:
     ss_add.add_argument("url", help="URL to ypms.json")
     ss_rm = src_sub.add_parser("remove", help="Remove a source")
     ss_rm.add_argument("name")
+
+    # refresh
+    sub.add_parser("refresh", help="Clear caches and re-fetch all sources")
+
+    # upgrade
+    sp_up = sub.add_parser("upgrade", help="Refresh caches and run 'update' for all installed packages")
+    sp_up.add_argument("--env", help="Target environment ID (default: all envs)")
+
+    # autoremove
+    sp_ar = sub.add_parser("autoremove", help="Uninstall non-explicit (dependency) packages if 'uninstall' is available")
+    sp_ar.add_argument("--env", help="Target environment ID (default: all envs)")
 
     return p
 
@@ -407,8 +735,11 @@ def _cmd_info(mgr: YPMSManager, args: argparse.Namespace) -> int:
 
 
 def _cmd_install(mgr: YPMSManager, args: argparse.Namespace) -> int:
-    dest = mgr.install(args.package, env=args.env, version=args.version, source_name=args.source)
-    print(f"Installed -> {dest}")
+    dest = mgr.install(args.package, env=args.env, version=args.version, source_name=args.source, explicit=True)
+    if dest:
+        print(f"Installed -> {dest}")
+    else:
+        print("Installed")
     return 0
 
 
@@ -438,6 +769,27 @@ def _cmd_sources(mgr: YPMSManager, args: argparse.Namespace) -> int:
         return 0
     raise YPMSError("Unknown sources subcommand")
 
+def _cmd_refresh(mgr: YPMSManager, _args: argparse.Namespace) -> int:
+    mgr.refresh_sources()
+    print("Refreshed: cache cleared and sources re-fetched.")
+    return 0
+
+def _cmd_upgrade(mgr: YPMSManager, args: argparse.Namespace) -> int:
+    results = mgr.upgrade(env=args.env)
+    if results:
+        print("\n".join(results))
+    else:
+        print("(nothing to upgrade)")
+    return 0
+
+def _cmd_autoremove(mgr: YPMSManager, args: argparse.Namespace) -> int:
+    results = mgr.autoremove(env=args.env)
+    if results:
+        print("\n".join(results))
+    else:
+        print("(nothing to autoremove)")
+    return 0
+
 
 # ---- main ------------------------------------------------------ #
 
@@ -457,7 +809,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         mgr = YPMSManager()
 
         if cmd in BUILTIN_CMDS:
-            parsed = full_parser.parse_args([cmd] + rest_after_cmd + (["-s", gargs.source] if gargs.source else []) + (["-v"] if gargs.verbose else []))
+            parsed = full_parser.parse_args(
+                [cmd] + rest_after_cmd
+                + (["-s", gargs.source] if gargs.source else [])
+                + (["-v"] if gargs.verbose else [])
+            )
             if cmd == "list":
                 return _cmd_list(mgr, parsed)
             elif cmd == "info":
@@ -468,6 +824,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return _cmd_envs(mgr, parsed)
             elif cmd == "sources":
                 return _cmd_sources(mgr, parsed)
+            elif cmd == "refresh":
+                return _cmd_refresh(mgr, parsed)
+            elif cmd == "upgrade":
+                return _cmd_upgrade(mgr, parsed)
+            elif cmd == "autoremove":
+                return _cmd_autoremove(mgr, parsed)
             else:
                 full_parser.print_help()
                 return 2
@@ -484,7 +846,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 version=dyn_args.version,
                 source_name=dyn_args.source,
             )
-            print(f"{cmd} -> {dest}")
+            if dest:
+                print(f"{cmd} -> {dest}")
+            else:
+                print(f"{cmd} done")
             return 0
         except YPMSError as e:
             print(f"[YPMS ERROR] {e}", file=sys.stderr)
