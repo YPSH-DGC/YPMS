@@ -45,6 +45,13 @@ DEFAULT_SOURCES: Dict[str, str] = {
 USER_AGENT = "YPMS (+https://github.com/YPSH-DGC/YPMS/)"
 HTTP_TIMEOUT = 20  # seconds
 
+# Verbose logging flag and helper
+_VERBOSE: bool = False
+def vlog(*msg: object) -> None:
+    """Verbose logger (enabled by -v or YPMS_DEBUG=1)."""
+    if _VERBOSE:
+        print("[DEBUG]", *msg, file=sys.stderr)
+
 
 # ---- Exceptions ------------------------------------------------ #
 
@@ -108,6 +115,7 @@ def _subst(s: str, *, env_dir: str, ctx: Dict[str, Any]) -> str:
 
 def _ensure_cache_dir() -> None:
     os.makedirs(CACHE_DIR, exist_ok=True)
+    vlog("cache-dir:", CACHE_DIR)
 
 def _cache_key(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest() + ".json"
@@ -115,10 +123,13 @@ def _cache_key(url: str) -> str:
 def _http_get_json(url: str, *, use_cache: bool = True, force_refresh: bool = False) -> Dict[str, Any]:
     _ensure_cache_dir()
     cpath = os.path.join(CACHE_DIR, _cache_key(url))
+    vlog("GET JSON:", url, "| use_cache=", use_cache, "force_refresh=", force_refresh)
     if use_cache and not force_refresh and os.path.exists(cpath):
         try:
             with open(cpath, "r", encoding="utf-8") as f:
-                return json.load(f)
+                obj = json.load(f)
+                vlog("cache-hit:", cpath)
+                return obj
         except Exception:
             pass
 
@@ -128,11 +139,13 @@ def _http_get_json(url: str, *, use_cache: bool = True, force_refresh: bool = Fa
             if resp.status != 200:
                 raise YPMSError(f"HTTP {resp.status} for {url}")
             data = resp.read()
+            vlog("http-status:", resp.status, "bytes=", len(data))
             try:
                 obj = json.loads(data.decode("utf-8"))
                 try:
                     with open(cpath, "w", encoding="utf-8") as f:
                         json.dump(obj, f, ensure_ascii=False, indent=2)
+                        vlog("cache-write:", cpath)
                 except Exception:
                     pass
                 return obj
@@ -144,6 +157,7 @@ def _http_get_json(url: str, *, use_cache: bool = True, force_refresh: bool = Fa
 
 def _http_download(url: str, dest_path: str) -> None:
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    vlog("DOWNLOAD:", url, "->", dest_path)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp, open(dest_path, "wb") as f:
@@ -154,12 +168,14 @@ def _http_download(url: str, dest_path: str) -> None:
                 if not chunk:
                     break
                 f.write(chunk)
+        vlog("download-done:", dest_path, "size=", os.path.getsize(dest_path))
     except urllib.error.URLError as e:
         raise YPMSError(f"Failed to download {url}: {e}") from e
 
 
 def _clear_all_cache() -> None:
     if os.path.isdir(CACHE_DIR):
+        vlog("cache-clear:", CACHE_DIR)
         shutil.rmtree(CACHE_DIR, ignore_errors=True)
 
 
@@ -181,6 +197,7 @@ class YPMSSource:
     def __init__(self, source_name: str, config_url: str, *, force_refresh: bool = False):
         self.source_name = source_name
         self.config_url = config_url
+        vlog("source-init:", source_name, "config:", config_url, "force_refresh=", force_refresh)
         cfg = _http_get_json(config_url, use_cache=True, force_refresh=force_refresh)
         try:
             self.config = RepoConfig(
@@ -196,12 +213,16 @@ class YPMSSource:
 
     # URLs
     def _index_url(self) -> str:
-        return f"{self.config.base_url}{self.config.path_index}"
+        url = f"{self.config.base_url}{self.config.path_index}"
+        vlog("index-url:", url)
+        return url
 
     def _package_url(self, user_id: str, package_id: str) -> str:
-        return f"{self.config.base_url}{self.config.path_package}".format(
+        url = f"{self.config.base_url}{self.config.path_package}".format(
             USER_ID=user_id, PACKAGE_ID=package_id
         )
+        vlog("package-url:", url)
+        return url
 
     # Fetchers
     def fetch_index(self, *, force_refresh: bool = False) -> Dict[str, Any]:
@@ -212,6 +233,7 @@ class YPMSSource:
 
     @staticmethod
     def resolve_release_tag(pkg_info: Dict[str, Any], tag: Optional[str]) -> str:
+        orig = tag
         if not tag:
             tag = pkg_info.get("package.release.default")
             if not tag:
@@ -222,7 +244,9 @@ class YPMSSource:
                 if lst:
                     tag = lst[0]
         alias = pkg_info.get("package.release.alias", {})
-        return alias.get(tag, tag)
+        resolved = alias.get(tag, tag)
+        vlog("resolve-release:", {"requested": orig, "resolved": resolved})
+        return resolved
 
     def fetch_release_info(self, pkg_info: Dict[str, Any], release_id: str, *, force_refresh: bool = False) -> Dict[str, Any]:
         url_tmpl = pkg_info["package.release.url"]
@@ -268,11 +292,12 @@ def _normalize_guide_to_steps(guide_obj: Any) -> List[Dict[str, Any]]:
         return steps
     return [guide_obj]
 
-def _exec_step_download_only(step: Dict[str, Any], *, env_dir: str) -> str:
+def _exec_step_download_file(step: Dict[str, Any], *, env_dir: str) -> str:
     content = step["content"]
     dest_template: str = content["dest"]
     url: str = content["url"]
     dest_path = dest_template.replace("{YPMS_ENV_DIR}", env_dir)
+    vlog("guide: download-file", {"url": url, "dest": dest_path})
     _http_download(url, dest_path)
     return dest_path
 
@@ -304,6 +329,7 @@ def _exec_step_python(step: Dict[str, Any], *, env_dir: str, context: Dict[str, 
             old_cwd = os.getcwd()
             os.makedirs(cwd, exist_ok=True)
             os.chdir(cwd)
+        vlog("guide: python", {"cwd": cwd, "code_len": len(code)})
         exec(compile(code, "<ypms_guide_python>", "exec"), g, l)
     finally:
         if old_cwd is not None:
@@ -369,13 +395,16 @@ def _exec_step_shell(step: Dict[str, Any], *, env_dir: str, context: Dict[str, A
         if isinstance(c, list):
             args = [ _subst(str(a), env_dir=env_dir, ctx=context) for a in c ]
             shell_flag = False if use_shell_default is None else use_shell_default
+            vlog("guide: shell(list)", {"args": args, "cwd": cwd, "shell": shell_flag})
             proc = subprocess.run(args, shell=shell_flag, cwd=cwd, env=env, check=check)
             last_code = proc.returncode
         else:
             cmd_str = _subst(str(c), env_dir=env_dir, ctx=context)
             shell_flag = True if use_shell_default is None else use_shell_default
+            vlog("guide: shell(str)", {"cmd": cmd_str, "cwd": cwd, "shell": shell_flag})
             proc = subprocess.run(cmd_str, shell=shell_flag, cwd=cwd, env=env, check=check)
             last_code = proc.returncode
+        vlog("guide: shell -> returncode", last_code)
 
     return "" if last_code == 0 else str(last_code)
 
@@ -408,6 +437,7 @@ def _exec_step_remove_file(step: Dict[str, Any], *, env_dir: str, context: Dict[
     removed = 0
     for p in paths:
         spath = _subst(p, env_dir=env_dir, ctx=context)
+        vlog("guide: remove-file", {"path": spath})
         if not os.path.exists(spath):
             if missing_ok:
                 continue
@@ -427,20 +457,23 @@ def _exec_step_remove_file(step: Dict[str, Any], *, env_dir: str, context: Dict[
 def _execute_guide_steps(*, guide_obj: Dict[str, Any], env_dir: str,
                          pkg_ctx: Dict[str, Any]) -> str:
     steps = _normalize_guide_to_steps(guide_obj)
+    vlog("guide: start", {"steps": len(steps), "env_dir": env_dir, "ctx": pkg_ctx})
     ran_any = False
     last_result = ""
     for step in steps:
         if not isinstance(step, dict):
             raise YPMSError("Guide step must be a dict")
-        if not _when_matches(step.get("when")):
+        matched = _when_matches(step.get("when"))
+        vlog("guide: step", {"type": step.get("type"), "when": step.get("when"), "matched": matched})
+        if not matched:
             continue
         gtype = step.get("type")
-        if gtype == "download-only":
-            last_result = _exec_step_download_only(step, env_dir=env_dir)
-        elif gtype == "python":
+        if gtype == "python":
             last_result = _exec_step_python(step, env_dir=env_dir, context=pkg_ctx)
         elif gtype == "shell":
             last_result = _exec_step_shell(step, env_dir=env_dir, context=pkg_ctx)
+        elif gtype in ["download-file", "download-only"]:
+            last_result = _exec_step_download_file(step, env_dir=env_dir)
         elif gtype == "remove-file":
             last_result = _exec_step_remove_file(step, env_dir=env_dir, context=pkg_ctx)
         elif gtype == "none":
@@ -567,6 +600,7 @@ class YPMSManager:
         if not url:
             raise YPMSError(f"Unknown source: {source_name}")
 
+        vlog("get-source:", {"name": source_name, "url": url, "force_refresh": force_refresh})
         src = YPMSSource(source_name, url, force_refresh=force_refresh)
         self._source_cache[source_name] = src
         return src
@@ -651,12 +685,15 @@ class YPMSManager:
     # ---- High level actions ----
     def install(self, package_ref: str, env: str = "default", version: Optional[str] = None,
                 source_name: Optional[str] = None, *, explicit: bool = True) -> str:
+        vlog("install: begin", {"package": package_ref, "env": env, "version": version, "source": source_name})
         user, pkg = self._split_pkg_ref(package_ref)
         src = self._get_source(source_name)
         env_dir = self.ensure_env_dir(env)
+        vlog("install: env_dir", env_dir)
         yp = YPMSPackage(src, user, pkg)
 
         resolved, rel = self._get_release_info(src, yp.pkg_info, version)
+        vlog("install: resolved", {"version": resolved})
         pkg_ctx = {
             "PACKAGE_REF": f"{user}/{pkg}",
             "SOURCE_NAME": src.source_name,
@@ -670,8 +707,10 @@ class YPMSManager:
 
         self._db_mark_installed(env=env, source=src.source_name,
                                 package_ref=f"{user}/{pkg}", version=resolved, explicit=explicit)
+        vlog("install: marked-installed", {"env": env, "source": src.source_name, "package": f"{user}/{pkg}", "version": resolved})
 
         for dep in rel.get("release.depends", []):
+            vlog("install: dep", dep)
             dep_src, dep_ref, dep_ver = self._parse_dep(dep)
             self.install(dep_ref,
                          env=env,
@@ -683,12 +722,14 @@ class YPMSManager:
 
     def run(self, package_ref: str, guide_name: str, env: str = "default", version: Optional[str] = None,
             source_name: Optional[str] = None) -> str:
+        vlog("run: begin", {"package": package_ref, "guide": guide_name, "env": env, "version": version, "source": source_name})
         user, pkg = self._split_pkg_ref(package_ref)
         src = self._get_source(source_name)
         env_dir = self.ensure_env_dir(env)
         yp = YPMSPackage(src, user, pkg)
 
         resolved, rel = self._get_release_info(src, yp.pkg_info, version)
+        vlog("run: resolved", {"version": resolved})
         pkg_ctx = {
             "PACKAGE_REF": f"{user}/{pkg}",
             "SOURCE_NAME": src.source_name,
@@ -703,21 +744,25 @@ class YPMSManager:
 
         if guide_name == "uninstall":
             self._db_mark_uninstalled(env=env, source=src.source_name, package_ref=f"{user}/{pkg}")
+            vlog("run: uninstalled", {"env": env, "source": src.source_name, "package": f"{user}/{pkg}"})
 
         return dest
 
     # ---- Refresh/Upgrade/Autoremove ----
     def refresh_sources(self) -> None:
+        vlog("refresh: clearing cache...")
         _clear_all_cache()
         self._source_cache.clear()
         for name, _url in self.sources_map.items():
             src = self._get_source(name, force_refresh=True)
+            vlog("refresh: fetch-index", {"source": name})
             _ = src.fetch_index(force_refresh=True)
 
     def upgrade(self, env: Optional[str] = None) -> List[str]:
         self.refresh_sources()
         results: List[str] = []
         installed_by_env = self.list_installed(env=env)
+        vlog("upgrade: installed-by-env keys", list(installed_by_env.keys()))
         for env_name, pkgs in installed_by_env.items():
             for _key, meta in pkgs.items():
                 src_name = meta["source"]
@@ -731,13 +776,16 @@ class YPMSManager:
                     if "not defined" in str(e):
                         continue
                     results.append(f"{env_name}:{package_ref} [ERROR] {e}")
+        vlog("upgrade: done", {"count": len(results)})
         return results
 
     def autoremove(self, env: Optional[str] = None) -> List[str]:
         results: List[str] = []
         installed_by_env = self.list_installed(env=env)
+        vlog("autoremove: scanning", {"env": env})
         for env_name, pkgs in installed_by_env.items():
             targets = [meta for meta in pkgs.values() if not meta.get("explicit")]
+            vlog("autoremove: targets", {"env": env_name, "count": len(targets)})
             for meta in targets:
                 src_name = meta["source"]
                 package_ref = meta["package"]
@@ -750,6 +798,7 @@ class YPMSManager:
                     if "not defined" in str(e):
                         continue
                     results.append(f"{env_name}:{package_ref} [ERROR] {e}")
+        vlog("autoremove: done", {"count": len(results)})
         return results
 
 
@@ -803,7 +852,7 @@ def _build_full_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _parse_global_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+def _parse_global_args(argv: List[str]) -> Tuple[argparse.Namespace, List[str]]:
     gp = argparse.ArgumentParser(add_help=False)
     gp.add_argument("-s", "--source")
     gp.add_argument("-v", "--verbose", action="store_true")
@@ -812,7 +861,7 @@ def _parse_global_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     return gargs, rest
 
 
-def _parse_dynamic_command_args(cmd: str, rest: list[str]) -> argparse.Namespace:
+def _parse_dynamic_command_args(cmd: str, rest: List[str]) -> argparse.Namespace:
     dp = argparse.ArgumentParser(
         prog=f"ypms {cmd}",
         description=f"Run release guide '{cmd}'",
@@ -897,9 +946,14 @@ def _cmd_autoremove(mgr: YPMSManager, args: argparse.Namespace) -> int:
 
 # ---- main ------------------------------------------------------ #
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     gargs, rest = _parse_global_args(argv)
+    global _VERBOSE
+    _VERBOSE = bool(gargs.verbose) or (os.environ.get("YPMS_DEBUG") == "1")
+    if _VERBOSE:
+        vlog("argv:", sys.argv)
+        vlog("globals:", {"source": gargs.source, "verbose": gargs.verbose})
 
     full_parser = _build_full_parser()
     if gargs.help or not rest:
@@ -908,15 +962,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cmd = rest[0]
     rest_after_cmd = rest[1:]
+    vlog("command:", cmd, "rest:", rest_after_cmd)
 
     try:
         mgr = YPMSManager()
+        vlog("mgr: ready", {"ypms_dir": mgr.ypms_dir, "envs_dir": mgr.envs_dir})
 
         if cmd in BUILTIN_CMDS:
             parsed = full_parser.parse_args(
-                [cmd] + rest_after_cmd
-                + (["-s", gargs.source] if gargs.source else [])
+                (["-s", gargs.source] if gargs.source else [])
                 + (["-v"] if gargs.verbose else [])
+                + [cmd] + rest_after_cmd
             )
             if cmd == "list":
                 return _cmd_list(mgr, parsed)
@@ -941,6 +997,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         dyn_args = _parse_dynamic_command_args(cmd, rest_after_cmd)
         if not getattr(dyn_args, "source", None):
             dyn_args.source = gargs.source
+        vlog("dyn-args:", vars(dyn_args))
 
         try:
             dest = mgr.run(
