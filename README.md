@@ -1,2 +1,2 @@
 # YPMS
-(In Development) YPSH Package Management Script
+YPSH Package Management Script
