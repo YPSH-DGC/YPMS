@@ -8,9 +8,9 @@ Of course, it can also be used for purposes other than YPSH.
 ## Installation
 
 > [!WARNING]
-> YPMS is not binary-based and relies on shebang.
-> Therefore, it does not work in some environments (most Windows environments).
-> We plan to address this in the future.
+> YPMS is not binary-based and relies on shebang.<br>
+> Therefore, it does not work in some environments (most Windows environments).<br>
+> We plan to address this in the future.<br>
 > (If you have a workaround, please help us by submitting a pull request.)
 
 ### Installation using PyYPSH
@@ -22,12 +22,12 @@ After that, you can use `ypms` as is. [^1]
 ## Contributing
 
 ### Package Submission
-If you'd like to add a new package, please send us a pull request.
-There are almost no restrictions on the type of package.
-You can publish a library for YPSH as a package, or even your own CLI tool.
-However, harmful packages may be rejected.
-Also, since YOPR is an official repository, it requires a certain level of recognition or expectation.
-You can also set up your own YPMS repository.
+If you'd like to add a new package, please send us a pull request.<br>
+There are almost no restrictions on the type of package.<br>
+You can publish a library for YPSH as a package, or even your own CLI tool.<br>
+However, harmful packages may be rejected.<br>
+Also, since YOPR is an official repository, it requires a certain level of recognition or expectation.<br>
+You can also set up your own YPMS repository.<br>
 In that case, see [Custom YPMS Repository].
 
 ### Contributing to YPMS Itself
