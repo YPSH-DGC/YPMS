@@ -42,7 +42,7 @@ DEFAULT_SOURCES: Dict[str, str] = {
     "yopr": "https://ypsh-dgc.github.io/YPMS/yopr/ypms.json"
 }
 
-USER_AGENT = "YPMS/1.1 (+https://github.com/YPSH-DGC/YPMS/)"
+USER_AGENT = "YPMS (+https://github.com/YPSH-DGC/YPMS/)"
 HTTP_TIMEOUT = 20  # seconds
 
 
