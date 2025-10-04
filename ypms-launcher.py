@@ -50,7 +50,11 @@ def _download_to(path: str, url: str) -> None:
 
 
 def update(tag: str = "latest") -> None:
-    url: str = f"https://github.com/YPSH-DGC/YPMS/releases/download/{tag}/ypms.py"
+    base = "https://github.com/YPSH-DGC/YPMS/releases"
+    if tag == "latest":
+        url = f"{base}/latest/download/ypms.py"
+    else:
+        url = f"{base}/download/{tag}/ypms.py"
     _download_to(YPMS_MAIN_PATH, url)
 
 
