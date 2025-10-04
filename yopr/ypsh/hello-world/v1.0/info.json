@@ -1,0 +1,15 @@
+{
+    "release.name": "Version 1.0",
+    "release.dependencies": {
+        "yopr/@system/ypsh": ">1.0"
+    },
+    "release.guides": {
+        "install": {
+            "type": "download-only",
+            "content": {
+                "dest": "{YPMS_ENV_DIR}/hello-world/hello-world.py",
+                "url": "https://ypsh-dgc.github.io/YPMS/yopr/packages/ypsh/hello-world/v1.0/hello-world.py"
+            }
+        }
+    }
+}

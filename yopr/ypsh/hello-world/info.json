@@ -1,0 +1,15 @@
+{
+    "package.name": "HelloWorldLib",
+    "package.desc": "Tester Package for YPMS",
+    "package.author": "DiamondGotCat <nercone@diamondgotcat.net>",
+    "package.release.url": "https://ypsh-dgc.github.io/YPMS/yopr/packages/ypsh/hello-world/{RELEASE_ID}/info.json",
+    "package.release.default": "v1.0",
+    "package.release.alias": {
+        "latest": "v1.0",
+        "stable": "v1.0",
+        "beta": "v1.0"
+    },
+    "package.release.list": [
+        "v1.0"
+    ]
+}

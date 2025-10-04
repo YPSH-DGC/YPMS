@@ -1,0 +1,10 @@
+{
+    "last-update.number": "1",
+    "ypms.repo.id": "yopr",
+    "ypms.repo.name": "YOPR",
+    "ypms.repo.desc": "YPSH Official Package Repository",
+    "ypms.repo.structure.version": "1.0",
+    "ypms.repo.url": "https://ypsh-dgc.github.io/YPMS/yopr",
+    "ypms.repo.path.index": "/index.json",
+    "ypms.repo.path.package": "/packages/{USER_ID}/{PACKAGE_ID}/info.json"
+}
