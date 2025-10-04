@@ -10,6 +10,10 @@
                 "dest": "{YPMS_ENV_DIR}/hello-world/hello-world.py",
                 "url": "https://ypsh-dgc.github.io/YPMS/yopr/ypsh/hello-world/v1.0/hello-world.py"
             }
+        },
+        "uninstall": {
+            "type": "remove-file",
+            "content": "{YPMS_ENV_DIR}/hello-world/hello-world.py"
         }
     }
 }
