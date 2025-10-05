@@ -14,7 +14,11 @@ Of course, it can also be used for purposes other than YPSH.
 > (If you have a workaround, please help us by submitting a pull request.)
 
 ### Installation using PyYPSH
-If you have already installed the PyYPSH runtime, running `ypsh --ypms` will install the launcher.
+**Prerequisite**
+- Python 3.x (Recommend 3.12+)
+- YPSH v8.1+
+
+If you have already installed the PyYPSH runtime, running `ypsh --ypms` will install the launcher.<br>
 After that, you can use `ypms` as is. [^1]
 
 [^1]: The `ypms` command is immediately available only if the default installation path of the ypsh binary has been added to your PATH environment variable. If not, you can run it using an absolute or relative path.
@@ -31,10 +35,10 @@ You can also set up your own YPMS repository.<br>
 In that case, see [Custom YPMS Repository].
 
 ### Contributing to YPMS Itself
-Contributions to YPMS itself are also welcome.
+Contributions to YPMS itself are also welcome.<br>
 You can contribute via issue or PR.
 
 ## Custom YPMS Repository
-Creating a YPMS repository is easy.
-Simply create a file structure based on the `yopr` directory in this repository and make it accessible via HTTPS.
+Creating a YPMS repository is easy.<br>
+Simply create a file structure based on the `yopr` directory in this repository and make it accessible via HTTPS.<br>
 *Some file customizations may be required.
