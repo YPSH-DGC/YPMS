@@ -20,13 +20,26 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple, List, Union
+from typing import Dict, Any, Optional, Tuple, List, Union, Callable
 
 try:
     from dotenv import load_dotenv  # type: ignore
 except Exception:  # pragma: no cover
     def load_dotenv(*args, **kwargs):  # type: ignore
         return False
+
+# ---- Optional Rich (UI) ---------------------------------------- #
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.text import Text
+    from rich.markup import escape as _rich_escape
+    _RICH_AVAILABLE = True
+except Exception:
+    Console = None  # type: ignore
+    Live = None     # type: ignore
+    Text = None     # type: ignore
+    _RICH_AVAILABLE = False
 
 # ---- Paths & Constants ----------------------------------------- #
 
@@ -48,9 +61,66 @@ HTTP_TIMEOUT = 20  # seconds
 # Verbose logging flag and helper
 _VERBOSE: bool = False
 def vlog(*msg: object) -> None:
-    """Verbose logger (enabled by -v or YPMS_DEBUG=1)."""
     if _VERBOSE:
         print("[DEBUG]", *msg, file=sys.stderr)
+
+# Pretty printing helpers
+class Colors:
+    """ ANSI Color Codes """
+    BLACK = "\033[0;30m"
+    RED = "\033[0;31m"
+    GREEN = "\033[0;32m"
+    BROWN = "\033[0;33m"
+    BLUE = "\033[0;34m"
+    PURPLE = "\033[0;35m"
+    CYAN = "\033[0;36m"
+    LIGHT_GRAY = "\033[0;37m"
+    DARK_GRAY = "\033[1;30m"
+    LIGHT_RED = "\033[1;31m"
+    LIGHT_GREEN = "\033[1;32m"
+    YELLOW = "\033[1;33m"
+    LIGHT_BLUE = "\033[1;34m"
+    LIGHT_PURPLE = "\033[1;35m"
+    LIGHT_CYAN = "\033[1;36m"
+    LIGHT_WHITE = "\033[1;37m"
+    BOLD = "\033[1m"
+    FAINT = "\033[2m"
+    ITALIC = "\033[3m"
+    UNDERLINE = "\033[4m"
+    BLINK = "\033[5m"
+    REPLACE = "\033[7m"
+    CROSSED = "\033[9m"
+    RESET = "\033[0m"
+
+def _p_info(msg: str) -> None:
+    print(f"{Colors.CYAN}(i){Colors.RESET} {msg}")
+
+def _p_action(msg: str) -> None:
+    print(f"{Colors.BLUE}(>){Colors.RESET} {msg}")
+
+def _p_warn(msg: str) -> None:
+    print(f"{Colors.YELLOW}(!){Colors.RESET} {msg}")
+
+def _p_success(msg: str) -> None:
+    print(f"{Colors.GREEN}{Colors.BOLD}(i) {msg}{Colors.RESET}")
+
+def _p_error(msg: str) -> None:
+    print(f"{Colors.RED}{Colors.BOLD}(!) {msg}{Colors.RESET}")
+
+def _p_question(msg: str) -> None:
+    print(f"{Colors.YELLOW}(?){Colors.RESET} {msg}", end="", flush=True)
+
+_CONSOLE = Console() if (_RICH_AVAILABLE and sys.stdout.isatty()) else None
+
+def _print_plan_item(i: int, kind: str, source: str, package_ref: str, version: Optional[str], footnote: Optional[int]) -> None:
+    sym_map = {"install": "+", "update": "^", "target": "*"}
+    color_map = {"install": "blue", "update": "yellow", "target": "cyan"}
+    sym = sym_map.get(kind, "?")
+    foot = f" *{footnote}" if footnote else ""
+    if _CONSOLE:
+        _CONSOLE.print(f"[white]{i}.[/] [bold {color_map.get(kind,'white')}]{sym}[/] [white]{source}/[/][bright_white]{package_ref}[/][white]@{version}{foot}[/]")
+    else:
+        print(f"{i}. {sym} {source}/{package_ref}@{version}{foot}")
 
 
 # ---- Exceptions ------------------------------------------------ #
@@ -155,20 +225,119 @@ def _http_get_json(url: str, *, use_cache: bool = True, force_refresh: bool = Fa
         raise YPMSError(f"Failed to GET {url}: {e}") from e
 
 
-def _http_download(url: str, dest_path: str) -> None:
+# ---- Live UI (per package) ------------------------------------ #
+
+class _PlainPackageUI:
+    """Fallback UI when Rich is unavailable: prints lines without live updates."""
+    def __init__(self, header: str):
+        self.header = header
+        print(header)
+
+    def set_header(self, text: str) -> None:
+        # Print replacement as a new line (no true replace in plain mode)
+        print(text)
+
+    def set_step(self, idx: int, text: str) -> None:
+        print(f"      {idx}. {text}")
+
+    def clear_steps_keep_header(self) -> None:
+        # nothing to clear in plain mode
+        pass
+
+class PackageLiveUI:
+    """Rich-backed UI: header + dynamic steps; steps disappear on finish; header is replaced."""
+    def __init__(self, header: str, header_style: Optional[str] = None):
+        self._use_rich = _RICH_AVAILABLE and sys.stdout.isatty()
+        self.header = header
+        if not self._use_rich:
+            self._plain = _PlainPackageUI(header)
+            return
+
+        self.console = Console()
+        self._header_text = Text(header, style=header_style or "")
+        self._steps: Dict[int, Text] = {}
+        self._live = Live(self._renderable(), console=self.console, refresh_per_second=20, transient=False)
+        self._live.start()
+
+    def _renderable(self):
+        if not self._use_rich:
+            return ""
+        # Render header + steps (sorted)
+        lines: List[Text] = [self._header_text]
+        for i in sorted(self._steps.keys()):
+            lines.append(self._steps[i])
+        return Group(*lines)
+
+    def set_header(self, text: str, style: Optional[str] = None) -> None:
+        if not self._use_rich:
+            self._plain.set_header(text)
+            return
+        self._header_text = Text(text, style=style or "")
+        self._live.update(self._renderable())
+
+    def set_step(self, idx: int, text: str, style: Optional[str] = None) -> None:
+        if not self._use_rich:
+            self._plain.set_step(idx, text)
+            return
+        self._steps[idx] = Text(f"      {idx}. {text}", style=style or "dim")
+        self._live.update(self._renderable())
+
+    def clear_steps_keep_header(self) -> None:
+        if not self._use_rich:
+            self._plain.clear_steps_keep_header()
+            return
+        self._steps.clear()
+        self._live.update(self._renderable())
+
+    def stop(self) -> None:
+        if self._use_rich:
+            self._live.stop()
+
+# ---- HTTP download with Live updates --------------------------- #
+
+def _http_download_with_progress(url: str, dest_path: str, *,
+                                 ui: Optional[PackageLiveUI] = None,
+                                 step_no: Optional[int] = None) -> None:
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    vlog("DOWNLOAD:", url, "->", dest_path)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp, open(dest_path, "wb") as f:
             if resp.status != 200:
                 raise YPMSError(f"HTTP {resp.status} for {url}")
+            total = resp.getheader("Content-Length")
+            total_size = int(total) if total and total.isdigit() else None
+            downloaded = 0
+            fname = os.path.basename(dest_path) or dest_path
+            label = f"Downloading {fname}"
+            if ui and step_no is not None:
+                ui.set_step(step_no, f"{label} (0%)" if total_size else label, style="dim")
+            else:
+                print(f"      {step_no}. {label}" if step_no else f"      {label}")
+            last_pct = -1
             while True:
                 chunk = resp.read(1024 * 64)
                 if not chunk:
                     break
                 f.write(chunk)
-        vlog("download-done:", dest_path, "size=", os.path.getsize(dest_path))
+                if total_size:
+                    downloaded += len(chunk)
+                    pct = int(downloaded * 100 / total_size)
+                    if pct != last_pct:
+                        last_pct = pct
+                        if ui and step_no is not None:
+                            ui.set_step(step_no, f"{label} ({pct}%)", style="dim")
+                        else:
+                            # overwrite-less fallback: print only on 10% steps
+                            if pct % 10 == 0:
+                                print(f"      {step_no}. {label} ({pct}%)" if step_no else f"      {label} ({pct}%)")
+            # completion line stays as 100% until the package UI clears steps
+            if ui and step_no is not None:
+                if total_size:
+                    ui.set_step(step_no, f"{label} (100%)", style="dim")
+                else:
+                    ui.set_step(step_no, f"Downloaded {fname}", style="dim")
+            else:
+                print(f"      {step_no}. Downloaded {fname}" if step_no else f"      Downloaded {fname}")
     except urllib.error.URLError as e:
         raise YPMSError(f"Failed to download {url}: {e}") from e
 
@@ -192,8 +361,6 @@ class RepoConfig:
 
 
 class YPMSSource:
-    """A single package source (repository)."""
-
     def __init__(self, source_name: str, config_url: str, *, force_refresh: bool = False):
         self.source_name = source_name
         self.config_url = config_url
@@ -211,20 +378,14 @@ class YPMSSource:
         except KeyError as e:
             raise YPMSError(f"Missing key in ypms.json ({config_url}): {e}") from e
 
-    # URLs
     def _index_url(self) -> str:
-        url = f"{self.config.base_url}{self.config.path_index}"
-        vlog("index-url:", url)
-        return url
+        return f"{self.config.base_url}{self.config.path_index}"
 
     def _package_url(self, user_id: str, package_id: str) -> str:
-        url = f"{self.config.base_url}{self.config.path_package}".format(
+        return f"{self.config.base_url}{self.config.path_package}".format(
             USER_ID=user_id, PACKAGE_ID=package_id
         )
-        vlog("package-url:", url)
-        return url
 
-    # Fetchers
     def fetch_index(self, *, force_refresh: bool = False) -> Dict[str, Any]:
         return _http_get_json(self._index_url(), use_cache=True, force_refresh=force_refresh)
 
@@ -255,8 +416,6 @@ class YPMSSource:
 
 
 class YPMSPackage:
-    """Represents a package in a given source."""
-
     def __init__(self, source: YPMSSource, user: str, pkg_id: str):
         self.source = source
         self.user = user
@@ -277,12 +436,6 @@ class YPMSPackage:
 # ---- Guide execution helpers ---------------------------------- #
 
 def _normalize_guide_to_steps(guide_obj: Any) -> List[Dict[str, Any]]:
-    """
-    Accepts either:
-      - {"type": "...", "content": {...}, "when": {...}}
-      - {"steps": [ {...}, {...} ]}
-    Returns a list of step dicts.
-    """
     if not isinstance(guide_obj, dict):
         raise YPMSError("Guide object must be a dict")
     if "steps" in guide_obj:
@@ -292,16 +445,16 @@ def _normalize_guide_to_steps(guide_obj: Any) -> List[Dict[str, Any]]:
         return steps
     return [guide_obj]
 
-def _exec_step_download_file(step: Dict[str, Any], *, env_dir: str) -> str:
+def _exec_step_download_file(step: Dict[str, Any], *, env_dir: str, ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
     content = step["content"]
     dest_template: str = content["dest"]
     url: str = content["url"]
     dest_path = dest_template.replace("{YPMS_ENV_DIR}", env_dir)
     vlog("guide: download-file", {"url": url, "dest": dest_path})
-    _http_download(url, dest_path)
+    _http_download_with_progress(url, dest_path, ui=ui, step_no=step_no)
     return dest_path
 
-def _exec_step_python(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any]) -> str:
+def _exec_step_python(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any], ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
     content = step.get("content")
     if isinstance(content, str):
         code = content
@@ -329,7 +482,7 @@ def _exec_step_python(step: Dict[str, Any], *, env_dir: str, context: Dict[str, 
             old_cwd = os.getcwd()
             os.makedirs(cwd, exist_ok=True)
             os.chdir(cwd)
-        vlog("guide: python", {"cwd": cwd, "code_len": len(code)})
+        ui.set_step(step_no or 0, "Executing python step") if ui else None
         exec(compile(code, "<ypms_guide_python>", "exec"), g, l)
     finally:
         if old_cwd is not None:
@@ -338,16 +491,7 @@ def _exec_step_python(step: Dict[str, Any], *, env_dir: str, context: Dict[str, 
     result_path = l.get("RESULT_PATH") or g.get("RESULT_PATH")
     return str(result_path) if result_path else ""
 
-def _exec_step_shell(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any]) -> str:
-    """
-    Execute external command(s).
-    content:
-      - "echo hello"                       (str -> run via shell)
-      - ["echo hello", "whoami"]           (list[str] -> each via shell)
-      - {"cmd": "echo hi", "cwd": "...", "env": {...}, "shell": true, "check": true}
-      - {"cmd": ["python", "-V"], "cwd": "...", "env": {...}, "check": true}
-      - {"cmd": [["python","-V"], ["pip","--version"]]}  (list[list[str]])
-    """
+def _exec_step_shell(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any], ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
     content = step.get("content")
     cmds: List[Union[str, List[str]]]
     cwd: Optional[str] = None
@@ -360,7 +504,7 @@ def _exec_step_shell(step: Dict[str, Any], *, env_dir: str, context: Dict[str, A
         use_shell_default = True
     elif isinstance(content, list):
         cmds = content
-        use_shell_default = True  # treat as list of strings to shell
+        use_shell_default = True
     elif isinstance(content, dict):
         cmd = content.get("cmd")
         if isinstance(cmd, (str, list)):
@@ -377,7 +521,6 @@ def _exec_step_shell(step: Dict[str, Any], *, env_dir: str, context: Dict[str, A
     else:
         raise YPMSError("shell guide: invalid content")
 
-    # env build
     env = os.environ.copy()
     env.update({
         "YPMS_ENV_DIR": env_dir,
@@ -389,33 +532,24 @@ def _exec_step_shell(step: Dict[str, Any], *, env_dir: str, context: Dict[str, A
     })
     env.update(extra_env)
 
-    # run sequence
     last_code = 0
     for c in cmds:
         if isinstance(c, list):
             args = [ _subst(str(a), env_dir=env_dir, ctx=context) for a in c ]
             shell_flag = False if use_shell_default is None else use_shell_default
-            vlog("guide: shell(list)", {"args": args, "cwd": cwd, "shell": shell_flag})
+            ui.set_step(step_no or 0, f"Running: {' '.join(args) if args else 'command'}") if ui else None
             proc = subprocess.run(args, shell=shell_flag, cwd=cwd, env=env, check=check)
             last_code = proc.returncode
         else:
             cmd_str = _subst(str(c), env_dir=env_dir, ctx=context)
             shell_flag = True if use_shell_default is None else use_shell_default
-            vlog("guide: shell(str)", {"cmd": cmd_str, "cwd": cwd, "shell": shell_flag})
+            ui.set_step(step_no or 0, f"Running: {cmd_str}") if ui else None
             proc = subprocess.run(cmd_str, shell=shell_flag, cwd=cwd, env=env, check=check)
             last_code = proc.returncode
-        vlog("guide: shell -> returncode", last_code)
 
     return "" if last_code == 0 else str(last_code)
 
-def _exec_step_remove_file(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any]) -> str:
-    """
-    Remove files/directories.
-    content:
-      - "/path/to/file"
-      - ["a", "b", "c"]
-      - {"path": "x"} or {"paths": ["x","y"], "missing_ok": true}
-    """
+def _exec_step_remove_file(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any], ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
     content = step.get("content")
     missing_ok = True
     paths: List[str] = []
@@ -437,7 +571,6 @@ def _exec_step_remove_file(step: Dict[str, Any], *, env_dir: str, context: Dict[
     removed = 0
     for p in paths:
         spath = _subst(p, env_dir=env_dir, ctx=context)
-        vlog("guide: remove-file", {"path": spath})
         if not os.path.exists(spath):
             if missing_ok:
                 continue
@@ -452,32 +585,177 @@ def _exec_step_remove_file(step: Dict[str, Any], *, env_dir: str, context: Dict[
             if missing_ok:
                 continue
             raise YPMSError(f"remove-file: failed to remove {spath}: {e}") from e
+    ui.set_step(step_no or 0, f"removed {removed} item(s)") if ui else None
     return f"removed={removed}"
 
+# --- New step types (install/uninstall pkg, add/remove repo) ----
+
+def _exec_step_install_package(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any],
+                               mgr: "YPMSManager", env: str, ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
+    content = step.get("content")
+    items: List[Tuple[Optional[str], str, Optional[str]]] = []
+    if isinstance(content, str):
+        items.append(YPMSManager._parse_dep(content))
+    elif isinstance(content, list):
+        for it in content:
+            items.append(YPMSManager._parse_dep(it))
+    elif isinstance(content, dict):
+        items.append(YPMSManager._parse_dep(content))
+    else:
+        raise YPMSError("install-package guide: invalid content")
+    db = mgr._db_load()
+    env_pkgs = db.get("envs", {}).get(env, {})
+    for src_name, pref, ver in items:
+        key = mgr._db_key(src_name or (context.get("SOURCE_NAME") or "yopr"), pref)
+        if key in env_pkgs:
+            continue
+        mgr._install_execute(pref, env=env, version=ver, source_name=(src_name or context.get("SOURCE_NAME")), explicit=False, print_header=True)
+    return ""
+
+def _exec_step_uninstall_package(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any],
+                                 mgr: "YPMSManager", env: str, ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
+    content = step.get("content")
+    items: List[Tuple[Optional[str], str, Optional[str]]] = []
+    if isinstance(content, str):
+        items.append(YPMSManager._parse_dep(content))
+    elif isinstance(content, list):
+        for it in content:
+            items.append(YPMSManager._parse_dep(it))
+    elif isinstance(content, dict):
+        items.append(YPMSManager._parse_dep(content))
+    else:
+        raise YPMSError("uninstall-package guide: invalid content")
+    db = mgr._db_load()
+    env_pkgs = db.get("envs", {}).get(env, {})
+    for src_name, pref, _ver in items:
+        key = mgr._db_key(src_name or (context.get("SOURCE_NAME") or "yopr"), pref)
+        if key not in env_pkgs:
+            continue
+        # dependents check
+        tsrc = (src_name or (context.get("SOURCE_NAME") or "yopr"))
+        dependents = mgr._find_dependents(env=env, target_source=tsrc, target_pref=pref)
+        if dependents and not getattr(mgr, "_force_flag", False):
+            raise YPMSError(f"uninstall blocked: other packages depend on {tsrc}/{pref}")
+        elif dependents and getattr(mgr, "_force_flag", False):
+            ui.set_step(step_no or 0, f"WARNING: dependents exist; proceeding due to --force") if ui else None
+        ui.set_step(step_no or 0, f"Uninstalling {pref}", style="red") if ui else None
+        try:
+            mgr.run(pref, "uninstall", env=env, version=None, source_name=(src_name or context.get("SOURCE_NAME")))
+        except YPMSError:
+            pass
+    return ""
+
+def _extract_add_repo_names(guide_obj: Any) -> List[str]:
+    names: List[str] = []
+    try:
+        steps = _normalize_guide_to_steps(guide_obj)
+    except Exception:
+        return names
+    for st in steps:
+        if not isinstance(st, dict):
+            continue
+        if st.get("type") == "add-repo":
+            cont = st.get("content")
+            if isinstance(cont, dict) and "name" in cont:
+                names.append(str(cont["name"]))
+            elif isinstance(cont, list):
+                for c in cont:
+                    if isinstance(c, dict) and "name" in c:
+                        names.append(str(c["name"]))
+            elif isinstance(cont, str):
+                parts = cont.strip().split()
+                if parts:
+                    names.append(parts[0])
+    return names
+
+def _exec_step_add_repo(step: Dict[str, Any], *, mgr: "YPMSManager", ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
+    cont = step.get("content")
+    entries: List[Tuple[str, str]] = []
+    if isinstance(cont, dict) and "name" in cont and "url" in cont:
+        entries.append((str(cont["name"]), str(cont["url"])))
+    elif isinstance(cont, list):
+        for e in cont:
+            if isinstance(e, dict) and "name" in e and "url" in e:
+                entries.append((str(e["name"]), str(e["url"])))
+    elif isinstance(cont, dict):
+        for k, v in cont.items():
+            entries.append((str(k), str(v)))
+    elif isinstance(cont, str):
+        parts = cont.strip().split()
+        if len(parts) >= 2:
+            entries.append((parts[0], parts[1]))
+    else:
+        raise YPMSError("add-repo guide: invalid content")
+    for name, url in entries:
+        if name not in mgr.sources_map:
+            mgr.add_source(name, url)
+            ui.set_step(step_no or 0, f"Added repo {name}") if ui else None
+    return ""
+
+def _exec_step_remove_repo(step: Dict[str, Any], *, mgr: "YPMSManager", ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
+    cont = step.get("content")
+    names: List[str] = []
+    if isinstance(cont, str):
+        names = [cont.strip()]
+    elif isinstance(cont, list):
+        names = [str(x) for x in cont]
+    elif isinstance(cont, dict):
+        if "name" in cont:
+            names = [str(cont["name"])]
+        elif "names" in cont and isinstance(cont["names"], list):
+            names = [str(x) for x in cont["names"]]
+    else:
+        raise YPMSError("remove-repo guide: invalid content")
+    for name in names:
+        if name in mgr.sources_map:
+            mgr.remove_source(name)
+            ui.set_step(step_no or 0, f"Removed repo {name}") if ui else None
+    return ""
+
+
 def _execute_guide_steps(*, guide_obj: Dict[str, Any], env_dir: str,
-                         pkg_ctx: Dict[str, Any]) -> str:
+                         pkg_ctx: Dict[str, Any],
+                         mgr: Optional["YPMSManager"] = None,
+                         env: Optional[str] = None,
+                         ui: Optional[PackageLiveUI] = None,
+                         force: bool = False) -> str:
     steps = _normalize_guide_to_steps(guide_obj)
-    vlog("guide: start", {"steps": len(steps), "env_dir": env_dir, "ctx": pkg_ctx})
     ran_any = False
     last_result = ""
-    for step in steps:
+    for idx, step in enumerate(steps, 1):
         if not isinstance(step, dict):
             raise YPMSError("Guide step must be a dict")
-        matched = _when_matches(step.get("when"))
-        vlog("guide: step", {"type": step.get("type"), "when": step.get("when"), "matched": matched})
-        if not matched:
+        if not _when_matches(step.get("when")):
             continue
         gtype = step.get("type")
         if gtype == "python":
-            last_result = _exec_step_python(step, env_dir=env_dir, context=pkg_ctx)
+            last_result = _exec_step_python(step, env_dir=env_dir, context=pkg_ctx, ui=ui, step_no=idx)
         elif gtype == "shell":
-            last_result = _exec_step_shell(step, env_dir=env_dir, context=pkg_ctx)
+            last_result = _exec_step_shell(step, env_dir=env_dir, context=pkg_ctx, ui=ui, step_no=idx)
         elif gtype in ["download-file", "download-only"]:
-            last_result = _exec_step_download_file(step, env_dir=env_dir)
+            last_result = _exec_step_download_file(step, env_dir=env_dir, ui=ui, step_no=idx)
         elif gtype == "remove-file":
-            last_result = _exec_step_remove_file(step, env_dir=env_dir, context=pkg_ctx)
+            last_result = _exec_step_remove_file(step, env_dir=env_dir, context=pkg_ctx, ui=ui, step_no=idx)
+        elif gtype == "install-package":
+            if mgr is None or env is None:
+                raise YPMSError("install-package step requires manager and env")
+            last_result = _exec_step_install_package(step, env_dir=env_dir, context=pkg_ctx, mgr=mgr, env=env, ui=ui, step_no=idx)
+        elif gtype == "uninstall-package":
+            if mgr is None or env is None:
+                raise YPMSError("uninstall-package step requires manager and env")
+            mgr._force_flag = force
+            last_result = _exec_step_uninstall_package(step, env_dir=env_dir, context=pkg_ctx, mgr=mgr, env=env, ui=ui, step_no=idx)
+        elif gtype == "add-repo":
+            if mgr is None:
+                raise YPMSError("add-repo step requires manager")
+            last_result = _exec_step_add_repo(step, mgr=mgr, ui=ui, step_no=idx)
+        elif gtype == "remove-repo":
+            if mgr is None:
+                raise YPMSError("remove-repo step requires manager")
+            last_result = _exec_step_remove_repo(step, mgr=mgr, ui=ui, step_no=idx)
         elif gtype == "none":
-            last_result = last_result  # do nothing
+            if ui: ui.set_step(idx, "(none)")
+            last_result = last_result
         else:
             raise YPMSError(f"Unsupported guide type: {gtype}")
         ran_any = True
@@ -489,8 +767,6 @@ def _execute_guide_steps(*, guide_obj: Dict[str, Any], env_dir: str,
 # ---- Manager --------------------------------------------------- #
 
 class YPMSManager:
-    """High-level manager for sources, packages, and environments."""
-
     def __init__(self, ypms_dir: str = YPMS_DIR, envs_dir: str = YPMS_ENVS_DIR):
         self.ypms_dir = ypms_dir
         self.envs_dir = envs_dir
@@ -521,8 +797,8 @@ class YPMSManager:
         with open(INSTALLED_DB_PATH, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
 
-    def _db_key(self, source: str, package_ref: str) -> str:
-        return f"{source}:{package_ref}"
+    def _db_key(self, source: Optional[str], package_ref: str) -> str:
+        return f"{source or 'yopr'}:{package_ref}"
 
     def _db_mark_installed(self, *, env: str, source: str, package_ref: str,
                            version: str, explicit: bool) -> None:
@@ -547,6 +823,12 @@ class YPMSManager:
         if key in e:
             e.pop(key)
             self._db_save(db)
+
+    def is_installed(self, *, env: str, source: str, package_ref: str) -> bool:
+        db = self._db_load()
+        envs = db.get("envs", {})
+        e = envs.get(env, {})
+        return self._db_key(source, package_ref) in e
 
     def list_installed(self, env: Optional[str] = None) -> Dict[str, Any]:
         db = self._db_load()
@@ -600,7 +882,6 @@ class YPMSManager:
         if not url:
             raise YPMSError(f"Unknown source: {source_name}")
 
-        vlog("get-source:", {"name": source_name, "url": url, "force_refresh": force_refresh})
         src = YPMSSource(source_name, url, force_refresh=force_refresh)
         self._source_cache[source_name] = src
         return src
@@ -643,7 +924,7 @@ class YPMSManager:
     @staticmethod
     def _split_pkg_ref(ref: str) -> Tuple[str, str]:
         if "/" not in ref:
-            raise YPMSError("Package ref must be 'USER/PACKAGE', e.g., 'ypsh/hello-world'")
+            raise YPMSError("Package ref must be 'USER/PACKAGE'")
         user, pkg = ref.split("/", 1)
         user = user.strip()
         pkg = pkg.strip()
@@ -651,18 +932,8 @@ class YPMSManager:
             raise YPMSError("Invalid package ref")
         return user, pkg
 
-    # ---- Dependency parsing (with cross-source) ----
     @staticmethod
     def _parse_dep(dep: Union[str, Dict[str, Any]]) -> Tuple[Optional[str], str, Optional[str]]:
-        """
-        Returns (source_name|None, package_ref, version_tag|None)
-        Accepts:
-          - "user/pkg"
-          - "user/pkg@tag"
-          - "source:user/pkg"
-          - "source:user/pkg@tag"
-          - { "package": "user/pkg", "version": "v1.2", "source": "yopr" }
-        """
         if isinstance(dep, str):
             src_name = None
             body = dep.strip()
@@ -680,56 +951,257 @@ class YPMSManager:
             if not pref or not isinstance(pref, str):
                 raise YPMSError("Invalid dependency object: missing 'package'")
             return (str(sname).strip() if sname else None), pref.strip(), (str(ver).strip() if ver else None)
-        raise YPMSError("Invalid dependency entry (must be string or object)")
+        raise YPMSError("Invalid dependency entry")
 
-    # ---- High level actions ----
-    def install(self, package_ref: str, env: str = "default", version: Optional[str] = None,
-                source_name: Optional[str] = None, *, explicit: bool = True) -> str:
-        vlog("install: begin", {"package": package_ref, "env": env, "version": version, "source": source_name})
+    def _find_dependents(self, *, env: str, target_source: str, target_pref: str) -> List[Dict[str, str]]:
+        """Return list of dependents that require target_pref from target_source."""
+        res: List[Dict[str, str]] = []
+        db = self._db_load().get("envs", {}).get(env, {})
+        for meta in db.values():
+            dep_src_name = meta["source"]
+            pkg_ref = meta["package"]  # "user/pkg"
+            version = meta.get("version")
+            # read its release and deps
+            u, p = self._split_pkg_ref(pkg_ref)
+            src = self._get_source(dep_src_name)
+            pkg_info = src.fetch_package_info(u, p)
+            rel = src.fetch_release_info(pkg_info, version)
+            for d in rel.get("release.depends", []):
+                ds, dr, dv = self._parse_dep(d)
+                ds = ds or target_source
+                if ds == target_source and dr == target_pref:
+                    # resolve requested version (alias) if any
+                    req_version = None
+                    if dv:
+                        dep_user, dep_pkg = self._split_pkg_ref(dr)
+                        dep_src_obj = self._get_source(ds)
+                        dep_pkg_info = dep_src_obj.fetch_package_info(dep_user, dep_pkg)
+                        req_version = dep_src_obj.resolve_release_tag(dep_pkg_info, dv)
+                    res.append({
+                        "dependent_source": dep_src_name,
+                        "dependent_package": pkg_ref,
+                        "dependent_version": version or "",
+                        "required_version": req_version or "",
+                    })
+        return res
+
+    def _check_update_compat(self, *, env: str, target_source: str, target_pref: str, new_version: str) -> List[str]:
+        """Return list of blocker messages (empty if compatible)."""
+        blockers: List[str] = []
+        for d in self._find_dependents(env=env, target_source=target_source, target_pref=target_pref):
+            req = d["required_version"]
+            # No version specified or 'latest' means accept anything
+            if not req or req.lower() == "latest" or req == "*":
+                continue
+            if req != new_version:
+                blockers.append(
+                    f"{d['dependent_source']}/{d['dependent_package']}@{d['dependent_version']} "
+                    f"requires {target_source}/{target_pref}@{req}, but planned {new_version}"
+                )
+        return blockers
+
+    # ---- Internal installer using Live UI -----------------------
+    def _install_execute(self, package_ref: str, env: str = "default", version: Optional[str] = None,
+                         source_name: Optional[str] = None, *, explicit: bool = True, print_header: bool = True, force: bool = False) -> str:
         user, pkg = self._split_pkg_ref(package_ref)
         src = self._get_source(source_name)
         env_dir = self.ensure_env_dir(env)
-        vlog("install: env_dir", env_dir)
         yp = YPMSPackage(src, user, pkg)
-
         resolved, rel = self._get_release_info(src, yp.pkg_info, version)
-        vlog("install: resolved", {"version": resolved})
         pkg_ctx = {
             "PACKAGE_REF": f"{user}/{pkg}",
             "SOURCE_NAME": src.source_name,
             "RELEASE_ID": resolved,
         }
-        guides = rel.get("release.guides", {})
-        guide = guides.get("install")
-        if not guide:
-            raise YPMSError("Guide 'install' not defined for this package")
-        dest = _execute_guide_steps(guide_obj=guide, env_dir=env_dir, pkg_ctx=pkg_ctx)
 
-        self._db_mark_installed(env=env, source=src.source_name,
-                                package_ref=f"{user}/{pkg}", version=resolved, explicit=explicit)
-        vlog("install: marked-installed", {"env": env, "source": src.source_name, "package": f"{user}/{pkg}", "version": resolved})
+        # Start per-package Live UI
+        header = f"(>) Installing {package_ref}@{resolved}"
+        ui = PackageLiveUI(header, header_style="bold cyan") if print_header else None
+        self._force_flag = force
+        try:
+            guide = rel.get("release.guides", {}).get("install")
+            if not guide:
+                raise YPMSError("Guide 'install' not defined for this package")
+            _execute_guide_steps(guide_obj=guide, env_dir=env_dir, pkg_ctx=pkg_ctx, mgr=self, env=env, ui=ui, force=force)
+            # Mark installed
+            self._db_mark_installed(env=env, source=src.source_name, package_ref=f"{user}/{pkg}", version=resolved, explicit=explicit)
+            # Autoinstall dependencies (quiet header per dep)
+            for dep in rel.get("release.depends", []):
+                dep_src, dep_ref, dep_ver = self._parse_dep(dep)
+                if self.is_installed(env=env, source=(dep_src or src.source_name), package_ref=dep_ref):
+                    continue
+                self._install_execute(dep_ref, env=env, version=dep_ver, source_name=(dep_src or src.source_name), explicit=False, print_header=True)
+            # Replace header & clear steps
+            if ui:
+                ui.set_header(f"(>) Installed {package_ref}@{resolved}", style="bold green")
+                ui.clear_steps_keep_header()
+        finally:
+            if ui:
+                ui.stop()
+        self._force_flag = False
 
-        for dep in rel.get("release.depends", []):
-            vlog("install: dep", dep)
-            dep_src, dep_ref, dep_ver = self._parse_dep(dep)
-            self.install(dep_ref,
-                         env=env,
-                         version=dep_ver,
-                         source_name=(dep_src or src.source_name),
-                         explicit=False)
+        return env_dir
 
-        return dest
+    # ---- Planning & high-level actions --------------------------
+    @dataclass
+    class _OpItem:
+        kind: str  # 'install' or 'update' or 'target'
+        source: str
+        package_ref: str
+        version: Optional[str]
+        footnote: Optional[int] = None
 
-    def run(self, package_ref: str, guide_name: str, env: str = "default", version: Optional[str] = None,
-            source_name: Optional[str] = None) -> str:
-        vlog("run: begin", {"package": package_ref, "guide": guide_name, "env": env, "version": version, "source": source_name})
+    def _build_operation_plan(self, *, package_ref: str, env: str, version: Optional[str], source_name: Optional[str]) -> Tuple[List["_OpItem"], Dict[int, str]]:
+        ops: List[YPMSManager._OpItem] = []
+        notes: Dict[int, str] = {}
         user, pkg = self._split_pkg_ref(package_ref)
         src = self._get_source(source_name)
+        _ = src.fetch_index()
+        yp = YPMSPackage(src, user, pkg)
+        resolved, rel = self._get_release_info(src, yp.pkg_info, version)
+
+        known_sources = set(self.sources_map.keys())
+        providers: Dict[str, str] = {}
+        dep_entries: List[Tuple[Optional[str], str, Optional[str]]] = []
+        for d in rel.get("release.depends", []):
+            dep_entries.append(self._parse_dep(d))
+
+        dep_rel_infos: List[Tuple[Optional[str], str, Optional[str], Dict[str, Any], str]] = []
+        for dep_src, dep_ref, dep_ver in dep_entries:
+            dep_user, dep_pkg = self._split_pkg_ref(dep_ref)
+            dep_src_name = dep_src or src.source_name
+            dep_src_obj = self._get_source(dep_src_name)
+            dep_pkg_info = dep_src_obj.fetch_package_info(dep_user, dep_pkg)
+            dep_resolved = dep_src_obj.resolve_release_tag(dep_pkg_info, dep_ver)
+            dep_rel_info = dep_src_obj.fetch_release_info(dep_pkg_info, dep_resolved)
+            add_names = _extract_add_repo_names(dep_rel_info.get("release.guides", {}).get("install"))
+            for nm in add_names:
+                providers[nm] = f"{dep_src_name}/{dep_ref}@{dep_resolved}"
+            dep_rel_infos.append((dep_src_name, dep_ref, dep_resolved, dep_rel_info, dep_src_name))
+
+        for dep_src_name, dep_ref, dep_resolved, _dep_rel, _ in dep_rel_infos:
+            kind = "update" if self.is_installed(env=env, source=dep_src_name, package_ref=dep_ref) else "install"
+            foot = None
+            if dep_src_name not in known_sources and dep_src_name in providers:
+                foot = len(notes) + 1
+                notes[foot] = f"This package repository will be installed by the following package: {providers[dep_src_name]}"
+            ops.append(YPMSManager._OpItem(kind=kind, source=dep_src_name, package_ref=dep_ref, version=dep_resolved, footnote=foot))
+
+        # target: already installed ? -> update or noop
+        target_key = self._db_key(src.source_name, f"{user}/{pkg}")
+        installed = self._db_load().get("envs", {}).get(env, {}).get(target_key)
+        if installed:
+            if installed.get("version") == resolved:
+                # nothing to do (no target op)
+                pass
+            else:
+                ops.append(YPMSManager._OpItem(kind="update", source=src.source_name, package_ref=f"{user}/{pkg}", version=resolved))
+        else:
+            ops.append(YPMSManager._OpItem(kind="target", source=src.source_name, package_ref=f"{user}/{pkg}", version=resolved))
+        return ops, notes
+
+    def install(self, package_ref: str, env: str = "default", version: Optional[str] = None,
+                source_name: Optional[str] = None, *, explicit: bool = True,
+                assume_yes: bool = False, force: bool = False) -> str:
+        try:
+            self._get_source(source_name).fetch_index()
+        except Exception:
+            pass
+        _p_action("Updated Local Index")
+
+        ops, notes = self._build_operation_plan(package_ref=package_ref, env=env, version=version, source_name=source_name)
+        _p_action("Built operation information")
+
+        print()
+
+        if not ops:
+            _p_info("Already installed. Nothing to do.")
+            return self.ensure_env_dir(env)
+        _p_info("This action will change the package state as follows:")
+        for i, it in enumerate(ops, 1):
+            _print_plan_item(i, it.kind, it.source, it.package_ref, it.version, it.footnote)
+        if notes:
+            _p_info("Supplementary information:")
+            for k, v in notes.items():
+                print(f"*{k}: {v}")
+
+        if not assume_yes:
+            _p_question("Continue? [Y/n] ")
+            ans = sys.stdin.readline().strip().lower()
+            if ans not in ("", "y", "yes"):
+                print("Aborted.")
+                return ""
+
+        print()
+
         env_dir = self.ensure_env_dir(env)
+        for it in ops:
+            if it.kind in ("install", "target"):
+                self._install_execute(it.package_ref, env=env, version=it.version, source_name=it.source, explicit=(it.kind == "target" and explicit), print_header=True)
+            elif it.kind == "update":
+                # dependency compatibility check
+                incompat = self._check_update_compat(env=env, target_source=it.source, target_pref=it.package_ref, new_version=it.version or "")
+                if incompat:
+                    if not force:
+                        if _CONSOLE:
+                            _CONSOLE.print("[bold red]Blocked by dependency constraints:[/]")
+                            for m in incompat:
+                                _CONSOLE.print(f"  - {m}")
+                        else:
+                            print("Blocked by dependency constraints:")
+                            print("\n".join(f"  - {m}" for m in incompat))
+                        return env_dir
+                    else:
+                        # show warnings and confirm
+                        if _CONSOLE:
+                            _CONSOLE.print("[bold yellow]WARNING: dependency constraints may be violated:[/]")
+                            for m in incompat:
+                                _CONSOLE.print(f"  - {m}")
+                        else:
+                            print("WARNING: dependency constraints may be violated:")
+                            print("\n".join(f"  - {m}" for m in incompat))
+                        if not assume_yes:
+                            _p_question("Continue anyway? [y/N] ")
+                            ans = sys.stdin.readline().strip().lower()
+                            if ans not in ("y", "yes"):
+                                print("Aborted.")
+                                return env_dir
+                try:
+                    header_ui = PackageLiveUI(f"(>) Updating {it.package_ref}@{it.version}", header_style="bold yellow")
+                    _ = self.run(package_ref=it.package_ref, guide_name="update", env=env, version=it.version, source_name=it.source)
+                    header_ui.set_header(f"(>) Updated {it.package_ref}@{it.version}", style="bold green")
+                    header_ui.clear_steps_keep_header()
+                    header_ui.stop()
+                except YPMSError as e:
+                    if "not defined" in str(e):
+                        # no update guide — skip silently
+                        pass
+                    else:
+                        raise
+        return env_dir
+
+    def run(self, package_ref: str, guide_name: str, env: str = "default", version: Optional[str] = None,
+            source_name: Optional[str] = None, *, force: bool = False, assume_yes: bool = False) -> str:
+        user, pkg = self._split_pkg_ref(package_ref)
+        env_dir = self.ensure_env_dir(env)
+
+        if guide_name == "uninstall":
+            env_db = self._db_load().get("envs", {}).get(env, {})
+            installed_meta = None
+            for _k, meta in env_db.items():
+                if meta.get("package") == f"{user}/{pkg}":
+                    installed_meta = meta
+                    break
+            if not installed_meta:
+                _p_info("Not installed. Nothing to do.")
+                return ""
+            if not source_name:
+                source_name = installed_meta.get("source")
+
+        src = self._get_source(source_name)
         yp = YPMSPackage(src, user, pkg)
 
         resolved, rel = self._get_release_info(src, yp.pkg_info, version)
-        vlog("run: resolved", {"version": resolved})
         pkg_ctx = {
             "PACKAGE_REF": f"{user}/{pkg}",
             "SOURCE_NAME": src.source_name,
@@ -740,12 +1212,48 @@ class YPMSManager:
         if not guide:
             raise YPMSError(f"Guide '{guide_name}' not defined for release '{resolved}'.")
 
-        dest = _execute_guide_steps(guide_obj=guide, env_dir=env_dir, pkg_ctx=pkg_ctx)
-
         if guide_name == "uninstall":
-            self._db_mark_uninstalled(env=env, source=src.source_name, package_ref=f"{user}/{pkg}")
-            vlog("run: uninstalled", {"env": env, "source": src.source_name, "package": f"{user}/{pkg}"})
+            dependents = self._find_dependents(env=env, target_source=src.source_name, target_pref=f"{user}/{pkg}")
+            if dependents:
+                if not force:
+                    if _CONSOLE:
+                        _CONSOLE.print("[bold red]Blocked: other packages depend on this package:[/]")
+                        for d in dependents:
+                            _CONSOLE.print(f"  - {d['dependent_source']}/{d['dependent_package']}@{d['dependent_version']} "
+                                           f"requires {src.source_name}/{user}/{pkg}@{d['required_version'] or '*'}")
+                    else:
+                        print("Blocked: other packages depend on this package:")
+                        for d in dependents:
+                            print(f"  - {d['dependent_source']}/{d['dependent_package']}@{d['dependent_version']} "
+                                  f"requires {src.source_name}/{user}/{pkg}@{d['required_version'] or '*'}")
+                    raise YPMSError("uninstall blocked by dependents")
+                else:
+                    if _CONSOLE:
+                        _CONSOLE.print("[bold yellow]WARNING: other packages depend on this package:[/]")
+                        for d in dependents:
+                            _CONSOLE.print(f"  - {d['dependent_source']}/{d['dependent_package']}@{d['dependent_version']} "
+                                           f"requires {src.source_name}/{user}/{pkg}@{d['required_version'] or '*'}")
+                    else:
+                        print("WARNING: other packages depend on this package:")
+                        for d in dependents:
+                            print(f"  - {d['dependent_source']}/{d['dependent_package']}@{d['dependent_version']} "
+                                  f"requires {src.source_name}/{user}/{pkg}@{d['required_version'] or '*'}")
+                    if not assume_yes:
+                        _p_question("Continue anyway? [y/N] ")
+                        ans = sys.stdin.readline().strip().lower()
+                        if ans not in ("y", "yes"):
+                            print("Aborted.")
+                            return env_dir
 
+        ui = PackageLiveUI(f"(>) Running guide '{guide_name}' for {package_ref}@{resolved}", header_style="bold magenta")
+        try:
+            dest = _execute_guide_steps(guide_obj=guide, env_dir=env_dir, pkg_ctx=pkg_ctx, mgr=self, env=env, ui=ui)
+            if guide_name == "uninstall":
+                self._db_mark_uninstalled(env=env, source=src.source_name, package_ref=f"{user}/{pkg}")
+            ui.set_header(f"(>) Finished guide '{guide_name}' for {package_ref}@{resolved}", style="bold green")
+            ui.clear_steps_keep_header()
+        finally:
+            ui.stop()
         return dest
 
     # ---- Refresh/Upgrade/Autoremove ----
@@ -755,14 +1263,12 @@ class YPMSManager:
         self._source_cache.clear()
         for name, _url in self.sources_map.items():
             src = self._get_source(name, force_refresh=True)
-            vlog("refresh: fetch-index", {"source": name})
             _ = src.fetch_index(force_refresh=True)
 
-    def upgrade(self, env: Optional[str] = None) -> List[str]:
+    def upgrade(self, env: Optional[str] = None, *, force: bool = False) -> List[str]:
         self.refresh_sources()
         results: List[str] = []
         installed_by_env = self.list_installed(env=env)
-        vlog("upgrade: installed-by-env keys", list(installed_by_env.keys()))
         for env_name, pkgs in installed_by_env.items():
             for _key, meta in pkgs.items():
                 src_name = meta["source"]
@@ -770,39 +1276,35 @@ class YPMSManager:
                 version = meta.get("version")
                 try:
                     res = self.run(package_ref=package_ref, guide_name="update",
-                                   env=env_name, version=version, source_name=src_name)
+                                   env=env_name, version=version, source_name=src_name, force=force, assume_yes=True)
                     results.append(f"{env_name}:{package_ref} -> {res}")
                 except YPMSError as e:
                     if "not defined" in str(e):
                         continue
                     results.append(f"{env_name}:{package_ref} [ERROR] {e}")
-        vlog("upgrade: done", {"count": len(results)})
         return results
 
-    def autoremove(self, env: Optional[str] = None) -> List[str]:
+    def autoremove(self, env: Optional[str] = None, *, force: bool = False) -> List[str]:
         results: List[str] = []
         installed_by_env = self.list_installed(env=env)
-        vlog("autoremove: scanning", {"env": env})
         for env_name, pkgs in installed_by_env.items():
             targets = [meta for meta in pkgs.values() if not meta.get("explicit")]
-            vlog("autoremove: targets", {"env": env_name, "count": len(targets)})
             for meta in targets:
                 src_name = meta["source"]
                 package_ref = meta["package"]
                 version = meta.get("version")
                 try:
                     res = self.run(package_ref=package_ref, guide_name="uninstall",
-                                   env=env_name, version=version, source_name=src_name)
+                                   env=env_name, version=version, source_name=src_name, force=force, assume_yes=True)
                     results.append(f"{env_name}:{package_ref} -> {res}")
                 except YPMSError as e:
                     if "not defined" in str(e):
                         continue
                     results.append(f"{env_name}:{package_ref} [ERROR] {e}")
-        vlog("autoremove: done", {"count": len(results)})
         return results
 
 
-# ---- CLI (flexible command parsing) ---------------------------- #
+# ---- CLI ------------------------------------------------------- #
 
 BUILTIN_CMDS = {"list", "info", "install", "envs", "sources", "refresh", "upgrade", "autoremove"}
 
@@ -820,7 +1322,7 @@ def _build_full_parser() -> argparse.ArgumentParser:
     sp_list.add_argument("-s", "--source", help="Source name (override global)")
 
     sp_info = sub.add_parser("info", help="Show package info")
-    sp_info.add_argument("package", help="Package ref USER/PACKAGE (e.g., ypsh/hello-world)")
+    sp_info.add_argument("package", help="Package ref USER/PACKAGE")
     sp_info.add_argument("-s", "--source", help="Source name (override global)")
     sp_info.add_argument("--version", help="Release tag or alias to resolve and show")
 
@@ -829,6 +1331,8 @@ def _build_full_parser() -> argparse.ArgumentParser:
     sp_inst.add_argument("--version", help="Release tag or alias (e.g., latest, v1.0)")
     sp_inst.add_argument("--env", default="default", help="Environment ID (default: default)")
     sp_inst.add_argument("-s", "--source", help="Source name (override global)")
+    sp_inst.add_argument("-y", "--yes", action="store_true", help="Assume yes to prompts and run non-interactively")
+    sp_inst.add_argument("-f", "--force", action="store_true", help="Force risky operations (override dependency blocks with warning)")
 
     sub.add_parser("envs", help="List environments")
 
@@ -845,9 +1349,11 @@ def _build_full_parser() -> argparse.ArgumentParser:
 
     sp_up = sub.add_parser("upgrade", help="Refresh caches and run 'update' for all installed packages")
     sp_up.add_argument("--env", help="Target environment ID (default: all envs)")
+    sp_up.add_argument("-f", "--force", action="store_true", help="Force risky operations")
 
     sp_ar = sub.add_parser("autoremove", help="Uninstall non-explicit (dependency) packages if 'uninstall' is available")
     sp_ar.add_argument("--env", help="Target environment ID (default: all envs)")
+    sp_ar.add_argument("-f", "--force", action="store_true", help="Force risky operations")
 
     return p
 
@@ -866,10 +1372,12 @@ def _parse_dynamic_command_args(cmd: str, rest: List[str]) -> argparse.Namespace
         prog=f"ypms {cmd}",
         description=f"Run release guide '{cmd}'",
     )
-    dp.add_argument("package", help="Package ref USER/PACKAGE (e.g., ypsh/hello-world)")
+    dp.add_argument("package", help="Package ref USER/PACKAGE")
     dp.add_argument("--version", help="Release tag or alias (e.g., latest, v1.0)")
     dp.add_argument("--env", default="default", help="Environment ID (default: default)")
     dp.add_argument("-s", "--source", help="Source name (override global)")
+    dp.add_argument("-y", "--yes", action="store_true", help="Assume yes to prompts (for warnings)")
+    dp.add_argument("-f", "--force", action="store_true", help="Force risky operations")
     return dp.parse_args(rest)
 
 
@@ -897,8 +1405,7 @@ def _cmd_info(mgr: YPMSManager, args: argparse.Namespace) -> int:
 
 
 def _cmd_install(mgr: YPMSManager, args: argparse.Namespace) -> int:
-    dest = mgr.install(args.package, env=args.env, version=args.version, source_name=args.source, explicit=True)
-    print(f"Installed -> {dest}" if dest else "Installed")
+    _ = mgr.install(args.package, env=args.env, version=args.version, source_name=args.source, explicit=True, assume_yes=args.yes, force=args.force)
     return 0
 
 
@@ -930,16 +1437,16 @@ def _cmd_sources(mgr: YPMSManager, args: argparse.Namespace) -> int:
 
 def _cmd_refresh(mgr: YPMSManager, _args: argparse.Namespace) -> int:
     mgr.refresh_sources()
-    print("Refreshed: cache cleared and sources re-fetched.")
+    _p_success("cache cleared and sources re-fetched.")
     return 0
 
 def _cmd_upgrade(mgr: YPMSManager, args: argparse.Namespace) -> int:
-    results = mgr.upgrade(env=args.env)
+    results = mgr.upgrade(env=args.env, force=args.force)
     print("\n".join(results) if results else "(nothing to upgrade)")
     return 0
 
 def _cmd_autoremove(mgr: YPMSManager, args: argparse.Namespace) -> int:
-    results = mgr.autoremove(env=args.env)
+    results = mgr.autoremove(env=args.env, force=args.force)
     print("\n".join(results) if results else "(nothing to autoremove)")
     return 0
 
@@ -962,11 +1469,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cmd = rest[0]
     rest_after_cmd = rest[1:]
-    vlog("command:", cmd, "rest:", rest_after_cmd)
 
     try:
         mgr = YPMSManager()
-        vlog("mgr: ready", {"ypms_dir": mgr.ypms_dir, "envs_dir": mgr.envs_dir})
 
         if cmd in BUILTIN_CMDS:
             parsed = full_parser.parse_args(
@@ -997,17 +1502,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         dyn_args = _parse_dynamic_command_args(cmd, rest_after_cmd)
         if not getattr(dyn_args, "source", None):
             dyn_args.source = gargs.source
-        vlog("dyn-args:", vars(dyn_args))
 
         try:
-            dest = mgr.run(
+            mgr.run(
                 package_ref=dyn_args.package,
                 guide_name=cmd,
                 env=dyn_args.env,
                 version=dyn_args.version,
                 source_name=dyn_args.source,
+                force=getattr(dyn_args, "force", False),
+                assume_yes=getattr(dyn_args, "yes", False),
             )
-            print(f"{cmd} -> {dest}" if dest else f"{cmd} done")
             return 0
         except YPMSError as e:
             print(f"[YPMS ERROR] {e}", file=sys.stderr)
