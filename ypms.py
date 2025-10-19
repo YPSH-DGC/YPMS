@@ -454,6 +454,18 @@ def _exec_step_download_file(step: Dict[str, Any], *, env_dir: str, ui: Optional
     _http_download_with_progress(url, dest_path, ui=ui, step_no=step_no)
     return dest_path
 
+def _exec_step_license_agreement(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any], ui: Optional[PackageLiveUI], step_no: Optional[int]) -> bool:
+    content = step.get("content")
+    if not isinstance(content, str):
+        raise YPMSError("license-agreement-url guide: invalid content")
+    vlog(f"Please review the license and press A key to accept: {content}")
+    b = sys.stdin.buffer.read(1)
+    if b == b'a':
+        vlog("Accepted.")
+        return True
+    else:
+        raise YPMSError("Not accepted the license.")
+
 def _exec_step_python(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any], ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
     content = step.get("content")
     if isinstance(content, str):
@@ -587,8 +599,6 @@ def _exec_step_remove_file(step: Dict[str, Any], *, env_dir: str, context: Dict[
             raise YPMSError(f"remove-file: failed to remove {spath}: {e}") from e
     ui.set_step(step_no or 0, f"removed {removed} item(s)") if ui else None
     return f"removed={removed}"
-
-# --- New step types (install/uninstall pkg, add/remove repo) ----
 
 def _exec_step_install_package(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any],
                                mgr: "YPMSManager", env: str, ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
@@ -728,7 +738,9 @@ def _execute_guide_steps(*, guide_obj: Dict[str, Any], env_dir: str,
         if not _when_matches(step.get("when")):
             continue
         gtype = step.get("type")
-        if gtype == "python":
+        if gtype == "license-agreement-url":
+            last_result = _exec_step_license_agreement(step, env_dir=env_dir, context=pkg_ctx, ui=ui, step_no=idx)
+        elif gtype == "python":
             last_result = _exec_step_python(step, env_dir=env_dir, context=pkg_ctx, ui=ui, step_no=idx)
         elif gtype == "shell":
             last_result = _exec_step_shell(step, env_dir=env_dir, context=pkg_ctx, ui=ui, step_no=idx)

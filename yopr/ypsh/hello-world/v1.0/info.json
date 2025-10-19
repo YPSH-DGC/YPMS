@@ -5,11 +5,19 @@
     },
     "release.guides": {
         "install": {
-            "type": "download-only",
-            "content": {
-                "dest": "{YPMS_ENV_DIR}/hello-world/hello-world.py",
-                "url": "https://ypsh-dgc.github.io/YPMS/yopr/ypsh/hello-world/v1.0/hello-world.py"
-            }
+            "steps": [
+                {
+                    "type": "license-agreement-url",
+                    "content": "https://raw.githubusercontent.com/YPSH-DGC/YPMS/refs/heads/main/LICENSE"
+                },
+                {
+                    "type": "download-only",
+                    "content": {
+                        "dest": "{YPMS_ENV_DIR}/hello-world/hello-world.py",
+                        "url": "https://ypsh-dgc.github.io/YPMS/yopr/ypsh/hello-world/v1.0/hello-world.py"
+                    }
+                }
+            ]
         },
         "uninstall": {
             "type": "remove-file",
