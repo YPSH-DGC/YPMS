@@ -1,3 +1,6 @@
+
+<img width="1920" alt="YPSH Header Black v26" src="https://github.com/user-attachments/assets/43076152-4342-4740-bf25-943773998fbb" />
+
 > [!IMPORTANT]
 > I am developing various projects, and since I manage, maintain, and update all of them myself, there may be times when I can't attend to each project individually.
 > For example, large-scale projects like [Zeta-LLM](https://github.com/Zeta-DGC/Zeta-LLM) are very difficult to develop.
