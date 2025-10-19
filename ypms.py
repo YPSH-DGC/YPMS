@@ -2,7 +2,7 @@
 
 # -- PyYPSH ----------------------------------------------------- #
 # ypms.py on PyYPSH                                               #
-# Made by DiamondGotCat, Licensed under MIT License               #
+# Made by DiamondGotCat and LLM, Licensed under MIT License       #
 # Copyright (c) 2025 DiamondGotCat                                #
 # ---------------------------------------------- DiamondGotCat -- #
 
@@ -246,6 +246,7 @@ class _PlainPackageUI:
 
 class PackageLiveUI:
     """Rich-backed UI: header + dynamic steps; steps disappear on finish; header is replaced."""
+    INDENT = "      "
     def __init__(self, header: str, header_style: Optional[str] = None):
         self._use_rich = _RICH_AVAILABLE and sys.stdout.isatty()
         self.header = header
@@ -292,6 +293,46 @@ class PackageLiveUI:
     def stop(self) -> None:
         if self._use_rich:
             self._live.stop()
+
+    def _stop_live(self) -> None:
+        try:
+            if self._use_rich:
+                self._live.stop()
+        except Exception:
+            pass
+
+    def _restart_live(self) -> None:
+        try:
+            if self._use_rich:
+                self._live = Live(self._renderable(), console=self.console, refresh_per_second=20, transient=False)
+                self._live.start()
+        except Exception:
+            pass
+
+    def prompt_step(self, idx: int, question: str, *, choices: str = "[Y/n]", default: str = "y") -> str:
+        self.set_step(idx, f"{question}", style="dim")
+        if self._use_rich:
+            self._steps[idx] = Text(f"{self.INDENT}{idx}. {question}", style="dim")
+            self._live.update(self._renderable())
+
+        prompt_line = f"{self.INDENT}   {choices} "
+
+        self._stop_live()
+        try:
+            if self._use_rich and hasattr(self.console, "input"):
+                raw = self.console.input(f"[dim]{prompt_line}[/dim]")
+            else:
+                print(prompt_line)
+                raw = input().strip()
+        except EOFError:
+            raw = ""
+        finally:
+            self._restart_live()
+
+        ans = (raw or "").strip().lower()
+        if not ans:
+            ans = default.lower()
+        return ans
 
 # ---- HTTP download with Live updates --------------------------- #
 
@@ -455,16 +496,31 @@ def _exec_step_download_file(step: Dict[str, Any], *, env_dir: str, ui: Optional
     return dest_path
 
 def _exec_step_license_agreement(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any], ui: Optional[PackageLiveUI], step_no: Optional[int]) -> bool:
-    content = step.get("content")
-    if not isinstance(content, str):
+    url = step.get("content")
+    if not isinstance(url, str) or not url.strip():
         raise YPMSError("license-agreement-url guide: invalid content")
-    vlog(f"Please review the license and press A key to accept: {content}")
-    b = sys.stdin.buffer.read(1)
-    if b == b'a':
-        vlog("Accepted.")
-        return True
+    msg = f"Please review the license: {url}"
+    if ui:
+        ui.set_step(step_no or 0, msg, style="dim")
     else:
-        raise YPMSError("Not accepted the license.")
+        _p_info(f"License: {url}")
+    idx = step_no or 0
+    if ui:
+        ans = ui.prompt_step(idx, "Accept?", choices="[Y/n]", default="y")
+    else:
+        _p_question("Accept? [Y/n] ")
+        try:
+            raw = sys.stdin.readline()
+        except EOFError:
+            raw = ""
+        ans = (raw or "").strip().lower() or "y"
+    if ans in ("a", "y", "yes"):
+        if ui:
+            ui.set_step(idx, "License accepted", style="green")
+        return True
+    if ui:
+        ui.set_step(idx, "License declined", style="red")
+    raise YPMSError("Not accepted the license.")
 
 def _exec_step_python(step: Dict[str, Any], *, env_dir: str, context: Dict[str, Any], ui: Optional[PackageLiveUI], step_no: Optional[int]) -> str:
     content = step.get("content")
