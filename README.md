@@ -1,5 +1,5 @@
 
-<img width="1920" alt="YPSH Header Black v26" src="https://github.com/user-attachments/assets/43076152-4342-4740-bf25-943773998fbb" />
+<img width="1920" alt="ypsh_full_black" src="https://github.com/user-attachments/assets/39d0a722-3cec-47bc-8b10-6fd1cddde3bb" />
 
 > [!IMPORTANT]
 > I am developing various projects, and since I manage, maintain, and update all of them myself, there may be times when I can't attend to each project individually.
